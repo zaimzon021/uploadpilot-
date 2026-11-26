@@ -1,0 +1,73 @@
+{
+  "name": "uploadpilot",
+  "productName": "UploadPilot",
+  "version": "0.1.0",
+  "description": "Auto-upload videos to many YouTube channels through YouTube Studio in isolated browser profiles",
+  "main": "electron/main.js",
+  "author": "UploadPilot",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "headless": "node src/headless.js",
+    "test": "node --test --test-concurrency=1 \"test/unit/**/*.test.js\"",
+    "test:e2e": "node --test --test-concurrency=1 \"test/e2e/**/*.test.js\"",
+    "test:all": "node --test --test-concurrency=1 \"test/unit/**/*.test.js\" \"test/e2e/**/*.test.js\"",
+    "smoke:electron": "xvfb-run -a -s \"-screen 0 1600x1000x24\" electron . --smoke --no-sandbox",
+    "build": "electron-builder --win nsis --x64",
+    "build:dir": "electron-builder --dir",
+    "build:win-dir": "electron-builder --win --x64 --dir"
+  },
+  "build": {
+    "appId": "com.uploadpilot.app",
+    "productName": "UploadPilot",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**",
+      "src/**",
+      "renderer/**",
+      "package.json",
+      "!test/**"
+    ],
+    "asarUnpack": [
+      "node_modules/better-sqlite3/prebuilds/**"
+    ],
+    "npmRebuild": false,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "shortcutName": "UploadPilot"
+    },
+    "linux": {
+      "target": [
+        "dir"
+      ]
+    }
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.2.0",
+    "chokidar": "^3.6.0",
+    "playwright-core": "1.65",
+    "socks": "^2.8.11"
+  },
+  "devDependencies": {
+    "electron": "^45.5.0",
+    "electron-builder": "^26.18.0"
+  }
+}

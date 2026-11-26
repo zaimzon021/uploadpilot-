@@ -1,0 +1,61 @@
+/* UploadPilot — dark theme, red accent (from mockups/base.css) */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:"Segoe UI","DejaVu Sans",Arial,sans-serif;background:#0f0f10;color:#eaeaea;display:flex;font-size:13px;overflow:hidden}
+a{color:inherit}
+.side{width:220px;flex:none;background:#161618;border-right:1px solid #262628;padding:20px 14px;position:relative}
+.logo{display:flex;align-items:center;gap:10px;font-weight:bold;font-size:17px;margin-bottom:28px}
+.logo .dot{width:30px;height:30px;border-radius:8px;background:#ff3b3b;display:flex;align-items:center;justify-content:center;font-size:14px}
+.nav a{display:block;padding:10px 12px;border-radius:8px;color:#bdbdbd;margin-bottom:4px;text-decoration:none;cursor:pointer}
+.nav a:hover{background:#202023}
+.nav a.on{background:#2a2a2d;color:#fff}
+.keys{position:absolute;bottom:22px;left:14px;right:14px}
+.main{flex:1;padding:26px 32px;overflow:auto}
+h1{font-size:22px;margin-bottom:4px}
+h2{font-size:16px;margin-bottom:10px}
+.sub{color:#8a8a8f;margin-bottom:20px}
+.btn{background:#ff3b3b;color:#fff;padding:9px 15px;border-radius:8px;font-weight:bold;display:inline-block;border:0;cursor:pointer;font:inherit;font-weight:bold}
+.btn:hover{filter:brightness(1.1)}
+.btn:disabled{opacity:.5;cursor:default}
+.btn.ghost{background:#2a2a2d;color:#eaeaea}
+.btn.sm{padding:5px 10px;font-size:12px;border-radius:6px}
+.btn.link{background:none;color:#f87171;padding:0}
+.card{background:#18181b;border:1px solid #29292c;border-radius:12px;padding:18px}
+.pill{padding:3px 9px;border-radius:20px;font-size:11px;font-weight:bold;display:inline-block;white-space:nowrap}
+.g{background:#123d24;color:#4ade80}.y{background:#3d3412;color:#facc15}.r{background:#3d1515;color:#f87171}.b{background:#12283d;color:#60a5fa}.gr{background:#2a2a2d;color:#aaa}
+table{width:100%;border-collapse:collapse}
+th{white-space:nowrap;text-align:left;color:#8a8a8f;font-weight:normal;padding:10px 8px;border-bottom:1px solid #29292c;font-size:12px}
+td{padding:10px 8px;border-bottom:1px solid #222225;vertical-align:middle}
+tr.click{cursor:pointer} tr.click:hover td{background:#1d1d20}
+.av{width:30px;height:30px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:bold;font-size:12px;margin-right:10px;vertical-align:middle;color:#fff;flex:none}
+.row{display:flex;gap:16px}
+.bar{height:6px;background:#2a2a2d;border-radius:4px;width:90px;display:inline-block;vertical-align:middle;margin-right:6px}
+.bar i{display:block;height:6px;background:#ff3b3b;border-radius:4px}
+.muted{color:#8a8a8f}.small{font-size:11px}
+.stat .num{font-size:28px;font-weight:bold;margin-top:6px}
+.feed{margin-top:14px;line-height:1.5;max-height:560px;overflow:auto}
+.feed .item{margin-bottom:12px}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+input,select,textarea{background:#111113;border:1px solid #29292c;border-radius:8px;color:#eaeaea;padding:9px 10px;font:inherit;width:100%}
+textarea{min-height:90px;resize:vertical;font-family:Consolas,"DejaVu Sans Mono",monospace;font-size:12px}
+input:focus,select:focus,textarea:focus{outline:1px solid #ff3b3b;border-color:#ff3b3b}
+label{display:block;color:#8a8a8f;margin-bottom:6px}
+.field{margin-bottom:14px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.modal{position:fixed;inset:0;background:#000a;display:flex;justify-content:center;align-items:flex-start;padding-top:60px;z-index:20}
+.modal.hidden,.hidden{display:none!important}
+.modal > .card{width:660px;max-height:85vh;overflow:auto}
+.steps{display:flex;gap:10px;margin-bottom:22px}
+.steps div{flex:1;border-top:3px solid #333;padding-top:8px;color:#8a8a8f}
+.steps div.on{border-top-color:#ff3b3b;color:#eaeaea;font-weight:bold}
+.okcard{background:#132017;border-color:#1f4d2c;display:flex;align-items:center;gap:14px;margin-bottom:20px}
+.waitcard{background:#141a22;border-color:#24364d;margin-bottom:20px}
+.toast{position:fixed;bottom:20px;right:20px;background:#2a2a2d;border:1px solid #3a3a3e;padding:12px 16px;border-radius:10px;z-index:30;max-width:420px}
+.toast.err{border-color:#7a2b2b;background:#2a1717}
+.inline-title{background:transparent;border:1px solid transparent;padding:6px}
+.inline-title:hover{border-color:#29292c}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid #555;border-top-color:#ff3b3b;border-radius:50%;animation:spin 1s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+code{background:#111113;padding:1px 5px;border-radius:4px}

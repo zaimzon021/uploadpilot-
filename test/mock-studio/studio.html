@@ -1,0 +1,219 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Channel dashboard - YouTube Studio</title>
+<style>
+  body{margin:0;font-family:Roboto,Arial,sans-serif;background:#f9f9f9;color:#0d0d0d}
+  header{height:56px;background:#fff;border-bottom:1px solid #ddd;display:flex;align-items:center;padding:0 16px;gap:12px}
+  header .grow{flex:1}
+  ytcp-button,ytcp-icon-button,tp-yt-paper-item{display:inline-block;cursor:pointer;user-select:none}
+  ytcp-button{border:1px solid #ccc;border-radius:4px;padding:8px 14px;background:#fff}
+  ytcp-button[disabled]{opacity:.4;pointer-events:none}
+  ytcp-navigation-drawer{position:fixed;top:56px;left:0;width:220px;bottom:0;background:#fff;border-right:1px solid #ddd;padding:16px}
+  main{margin-left:240px;padding:24px}
+  #creation-menu{position:absolute;top:50px;right:20px;background:#fff;border:1px solid #ccc;box-shadow:0 2px 8px #0003;z-index:5}
+  #creation-menu tp-yt-paper-item{display:block;padding:10px 20px}
+  .overlay{position:fixed;inset:0;background:#0006;display:flex;align-items:center;justify-content:center;z-index:10}
+  ytcp-uploads-dialog tp-yt-paper-dialog{display:block;background:#fff;width:960px;max-height:90vh;overflow:auto;border-radius:8px;padding:20px;position:relative}
+  #textbox{border:1px solid #bbb;min-height:40px;padding:8px;margin:6px 0 14px;white-space:pre-wrap}
+  #description-textarea #textbox{min-height:120px}
+  tp-yt-paper-radio-button{display:block;padding:6px;cursor:pointer}
+  tp-yt-paper-radio-button[aria-checked="true"]::before{content:"◉ "} tp-yt-paper-radio-button[aria-checked="false"]::before{content:"○ "}
+  .chip{display:inline-block;background:#eee;border-radius:12px;padding:2px 8px;margin:2px}
+  .footer{display:flex;align-items:center;gap:10px;border-top:1px solid #ddd;margin-top:16px;padding-top:12px}
+  .footer .grow{flex:1}
+  ytcp-dialog tp-yt-paper-dialog, ytcp-video-share-dialog tp-yt-paper-dialog{display:block;background:#fff;padding:24px;border-radius:8px;width:420px}
+  .spin{width:40px;height:40px;border:4px solid #ccc;border-top-color:#c00;border-radius:50%;animation:s 1s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+  .err{color:#c00}
+  input#file-loader, ytcp-uploads-file-picker input[type=file]{display:none}
+</style>
+<script>window.ytcfg = {"channelId":"UCmockchannel00000001","channelHandle":"@mockchannel","canonicalBaseUrl":"/@mockchannel"};</script>
+</head>
+<body>
+<ytcp-app>
+  <header>
+    <b>Studio</b><span class="grow"></span>
+    <ytcp-icon-button id="upload-icon" title="Upload videos" aria-label="Upload videos">⇪</ytcp-icon-button>
+    <ytcp-button id="create-icon" aria-label="Create">＋ Create</ytcp-button>
+  </header>
+  <ytcp-navigation-drawer><div id="entity-name">Mock Channel</div><div class="muted">Your channel</div></ytcp-navigation-drawer>
+  <main><h2>Channel dashboard</h2><p>Latest video performance…</p></main>
+</ytcp-app>
+<div id="root"></div>
+<script>
+(async function () {
+  const modeInfo = await fetch('/__mode').then(r => r.json());
+  const MODE = modeInfo.mode, OPTS = modeInfo.opts || {};
+  const ev = type => fetch('/__event', { method: 'POST', body: JSON.stringify({ type }) });
+  const $ = (s, r = document) => r.querySelector(s);
+  const root = $('#root');
+
+  if (MODE === 'spinner') {
+    // Studio never finishes loading: hide app, show spinner forever
+    document.querySelector('ytcp-app').style.display = 'none';
+    root.innerHTML = '<div style="display:flex;justify-content:center;padding-top:200px"><tp-yt-paper-spinner class="spin" role="progressbar"></tp-yt-paper-spinner></div>';
+    return;
+  }
+
+  // ---- Create menu
+  $('#create-icon').addEventListener('click', () => {
+    if ($('#creation-menu')) return;
+    const m = document.createElement('tp-yt-paper-listbox'); m.id = 'creation-menu';
+    m.innerHTML = '<tp-yt-paper-item id="text-item-0">Upload videos</tp-yt-paper-item><tp-yt-paper-item id="text-item-1">Go live</tp-yt-paper-item>';
+    document.body.appendChild(m);
+    $('#text-item-0').addEventListener('click', () => { m.remove(); openUpload(); });
+    $('#text-item-1').addEventListener('click', () => m.remove());
+  });
+  $('#upload-icon').addEventListener('click', () => openUpload());
+
+  // contenteditable -> plain text without relying on layout (pane may be hidden)
+  const textOf = el => { let out = ''; el.childNodes.forEach(n => { if (n.nodeType === 3) out += n.textContent; else if (n.nodeName === 'BR') out += '\n'; else { const t = textOf(n); out += (out && !out.endsWith('\n') ? '\n' : '') + t; } }); return out; };
+  let seed = 12345; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
+  function errorDialog(msg) {
+    ev('error_shown');
+    const d = document.createElement('ytcp-dialog');
+    d.innerHTML = `<div class="overlay" style="z-index:30"><tp-yt-paper-dialog role="alertdialog"><h3>Something went wrong</h3><p>${msg || 'Something went wrong. Please try again.'}</p><ytcp-button id="close-button">Close</ytcp-button></tp-yt-paper-dialog></div>`;
+    document.body.appendChild(d);
+    d.querySelector('#close-button').addEventListener('click', () => d.remove());
+  }
+
+  function openUpload() {
+    if ($('ytcp-uploads-dialog')) return;
+    const dlg = document.createElement('ytcp-uploads-dialog');
+    dlg.innerHTML = `<div class="overlay"><tp-yt-paper-dialog id="dialog">
+      <div style="display:flex"><h2 id="dialog-title" style="flex:1">Upload videos</h2><ytcp-button id="close-button" aria-label="Close">✕</ytcp-button></div>
+      <ytcp-uploads-file-picker>
+        <div style="text-align:center;padding:60px">Drag and drop video files to upload<br><br>
+        <ytcp-button id="select-files-button">SELECT FILES</ytcp-button>
+        <input type="file" name="Filedata" accept="video/*"></div>
+      </ytcp-uploads-file-picker>
+      <div id="steps" hidden>
+        <ytcp-stepper><span id="step-title-0">Details</span> · <span id="step-title-1">Video elements</span> · <span id="step-title-2">Checks</span> · <span id="step-title-3">Visibility</span></ytcp-stepper>
+        <div style="display:flex;gap:20px">
+        <div style="flex:1">
+          <ytcp-uploads-details>
+            <ytcp-video-metadata-editor-basics>
+              <h3>Details</h3>
+              <ytcp-social-suggestions-textbox id="title-textarea"><label>Title (required)</label><div id="textbox" contenteditable="true" aria-label="Add a title that describes your video (type @ to mention a channel)"></div></ytcp-social-suggestions-textbox>
+              <ytcp-social-suggestions-textbox id="description-textarea"><label>Description</label><div id="textbox" contenteditable="true" aria-label="Tell viewers about your video (type @ to mention a channel)"></div></ytcp-social-suggestions-textbox>
+              <h4>Thumbnail</h4>
+              <ytcp-thumbnails-compact-editor-uploader><ytcp-button id="thumb-btn">Upload file</ytcp-button><input type="file" id="file-loader" accept="image/jpeg,image/png"><span id="thumb-name"></span></ytcp-thumbnails-compact-editor-uploader>
+              <h4>Audience</h4><p>Is this video made for kids? (required)</p>
+              <tp-yt-paper-radio-group id="kids-group">
+                <tp-yt-paper-radio-button name="VIDEO_MADE_FOR_KIDS_MFK" role="radio" aria-checked="false">Yes, it's made for kids</tp-yt-paper-radio-button>
+                <tp-yt-paper-radio-button name="VIDEO_MADE_FOR_KIDS_NOT_MFK" role="radio" aria-checked="false">No, it's not made for kids</tp-yt-paper-radio-button>
+              </tp-yt-paper-radio-group>
+              <div class="err" id="kids-err" hidden>Select an audience option</div>
+            </ytcp-video-metadata-editor-basics>
+            <ytcp-button id="toggle-button">Show more</ytcp-button>
+            <div id="advanced" hidden>
+              <ytcp-form-input-container id="tags-container"><label>Tags</label><div id="chips"></div><input id="text-input" aria-label="Tags" placeholder="Add tag"></ytcp-form-input-container>
+            </div>
+          </ytcp-uploads-details>
+          <ytcp-uploads-video-elements hidden><h3>Video elements</h3><p>Add subtitles, end screen, cards.</p></ytcp-uploads-video-elements>
+          <ytcp-uploads-checks hidden><h3>Checks</h3><p id="checks-text">Checking for copyright… </p></ytcp-uploads-checks>
+          <ytcp-uploads-review hidden><h3>Visibility</h3>
+            <tp-yt-paper-radio-group id="privacy-radios">
+              <tp-yt-paper-radio-button name="PRIVATE" role="radio" aria-checked="true">Private</tp-yt-paper-radio-button>
+              <tp-yt-paper-radio-button name="UNLISTED" role="radio" aria-checked="false">Unlisted</tp-yt-paper-radio-button>
+              <tp-yt-paper-radio-button name="PUBLIC" role="radio" aria-checked="false">Public</tp-yt-paper-radio-button>
+            </tp-yt-paper-radio-group>
+          </ytcp-uploads-review>
+        </div>
+        <ytcp-video-info style="width:260px;background:#f2f2f2;padding:12px"><div>Video link</div><span class="video-url-fadeable"><a id="vlink" target="_blank"></a></span><div>Filename</div><div id="fname"></div></ytcp-video-info>
+        </div>
+        <div class="footer">
+          <ytcp-video-upload-progress><span class="progress-label">Uploading 0%…</span></ytcp-video-upload-progress>
+          <span class="grow"></span>
+          <ytcp-button id="back-button" hidden>Back</ytcp-button>
+          <ytcp-button id="next-button">Next</ytcp-button>
+          <ytcp-button id="done-button" hidden>Save</ytcp-button>
+        </div>
+      </div>
+    </tp-yt-paper-dialog></div>`;
+    document.body.appendChild(dlg);
+    const q = s => dlg.querySelector(s);
+    let step = 0, pct = 0, videoId = null, uploaded = false, fileName = '', thumbName = '';
+    const panes = ['ytcp-uploads-details', 'ytcp-uploads-video-elements', 'ytcp-uploads-checks', 'ytcp-uploads-review'];
+    const show = () => {
+      panes.forEach((p, i) => { q(p).hidden = i !== step; });
+      q('#back-button').hidden = step === 0;
+      q('#next-button').hidden = step === 3;
+      q('#done-button').hidden = step !== 3;
+    };
+    q('#close-button').addEventListener('click', () => dlg.remove());
+    q('#select-files-button').addEventListener('click', () => q('ytcp-uploads-file-picker input').click());
+    q('#thumb-btn').addEventListener('click', () => q('#file-loader').click());
+    q('#file-loader').addEventListener('change', e => { thumbName = e.target.files[0]?.name || ''; q('#thumb-name').textContent = thumbName; });
+    dlg.querySelectorAll('tp-yt-paper-radio-group').forEach(g => g.addEventListener('click', e => {
+      const b = e.target.closest('tp-yt-paper-radio-button'); if (!b) return;
+      g.querySelectorAll('tp-yt-paper-radio-button').forEach(x => x.setAttribute('aria-checked', String(x === b)));
+      if (g.id === 'privacy-radios') q('#done-button').textContent = b.getAttribute('name') === 'PRIVATE' ? 'Save' : 'Publish';
+    }));
+    q('#toggle-button').addEventListener('click', () => { const a = q('#advanced'); a.hidden = !a.hidden; q('#toggle-button').textContent = a.hidden ? 'Show more' : 'Show less'; });
+    const tagInput = q('#text-input');
+    const addChip = t => { t = t.trim(); if (!t) return; const c = document.createElement('span'); c.className = 'chip'; c.textContent = t; q('#chips').appendChild(c); };
+    tagInput.addEventListener('input', () => { if (tagInput.value.includes(',')) { const parts = tagInput.value.split(','); tagInput.value = parts.pop(); parts.forEach(addChip); } });
+    tagInput.addEventListener('keydown', e => { if (e.key === 'Enter') { addChip(tagInput.value); tagInput.value = ''; } });
+
+    q('ytcp-uploads-file-picker input').addEventListener('change', e => {
+      const f = e.target.files[0]; if (!f) return;
+      fileName = f.name; ev('upload_started');
+      if (MODE === 'limit') { dlg.remove(); errorDialogLimit(); return; }
+      q('ytcp-uploads-file-picker').hidden = true; q('#steps').hidden = false;
+      q('#dialog-title').textContent = fileName.replace(/\.[^.]+$/, '');
+      q('#title-textarea #textbox').textContent = fileName.replace(/\.[^.]+$/, '');
+      q('#fname').textContent = fileName;
+      videoId = 'mock' + Math.random().toString(36).slice(2, 10);
+      const link = q('#vlink'); link.href = 'https://youtu.be/' + videoId; link.textContent = 'https://youtu.be/' + videoId;
+      show();
+      const total = MODE === 'slow' ? 40 : (OPTS.uploadSteps || 8);
+      const label = q('.progress-label');
+      const timer = setInterval(() => {
+        if (MODE === 'stuck' && pct >= 37) { label.textContent = 'Uploading 37%… 12 minutes left'; return; }
+        pct = Math.min(100, pct + Math.ceil(100 / total));
+        if (pct < 100) label.textContent = `Uploading ${pct}%…`;
+        else { clearInterval(timer); uploaded = true; label.textContent = 'Upload complete … Processing will begin shortly'; setTimeout(() => { label.textContent = 'Checks complete. No issues found.'; q('#checks-text').textContent = 'No issues found'; }, 800); }
+      }, 300);
+      if (MODE === 'dialog_vanish' && modeInfo.vanished < 1 && !window.__vanished) {
+        window.__vanished = true;
+        setTimeout(() => { ev('vanished'); clearInterval(timer); dlg.remove(); }, 1500);
+      }
+    });
+    function errorDialogLimit() { ev('error_shown'); const d = document.createElement('ytcp-dialog'); d.innerHTML = '<div class="overlay"><tp-yt-paper-dialog role="alertdialog"><h3>Daily upload limit reached</h3><p>You can upload more videos in 24 hours.</p><ytcp-button id="close-button">Close</ytcp-button></tp-yt-paper-dialog></div>'; document.body.appendChild(d); }
+
+    let errorsShownHere = 0;
+    q('#next-button').addEventListener('click', () => {
+      if (step === 0) {
+        const sel = dlg.querySelector('#kids-group tp-yt-paper-radio-button[aria-checked="true"]');
+        if (!sel) { q('#kids-err').hidden = false; return; }
+        q('#kids-err').hidden = true;
+        const t = q('#title-textarea #textbox').innerText.trim();
+        if (!t) return;
+      }
+      if ((MODE === 'error_once' && modeInfo.errorShown + errorsShownHere < 1 && step === (OPTS.errorAtStep ?? 0)) || (MODE === 'error_random' && rnd() < (OPTS.p ?? 0.5) && errorsShownHere < 3)) {
+        errorsShownHere++; errorDialog(); return;   // Next click is swallowed by the error
+      }
+      step = Math.min(3, step + 1); show();
+    });
+    q('#back-button').addEventListener('click', () => { step = Math.max(0, step - 1); show(); });
+    q('#done-button').addEventListener('click', async () => {
+      const vis = dlg.querySelector('#privacy-radios [aria-checked="true"]').getAttribute('name');
+      const payload = {
+        title: q('#title-textarea #textbox').innerText.trim(),
+        description: textOf(q('#description-textarea #textbox')).replace(/\n$/, ''),
+        tags: [...dlg.querySelectorAll('#chips .chip')].map(c => c.textContent),
+        kids: dlg.querySelector('#kids-group [aria-checked="true"]').getAttribute('name'),
+        visibility: vis, fileName, thumb: thumbName, uploadedBeforePublish: uploaded, videoId,
+      };
+      await fetch('/__submit', { method: 'POST', body: JSON.stringify(payload) });
+      dlg.remove();
+      const sd = document.createElement('ytcp-video-share-dialog');
+      sd.innerHTML = `<div class="overlay"><tp-yt-paper-dialog><h3>${vis === 'PUBLIC' ? 'Video published' : 'Video saved'}</h3><p>Video link</p><a id="share-url" href="https://youtu.be/${videoId}">https://youtu.be/${videoId}</a><p>${uploaded ? 'Video processing' : 'Video uploading…'}</p><ytcp-button id="close-button">Close</ytcp-button></tp-yt-paper-dialog></div>`;
+      document.body.appendChild(sd);
+      sd.querySelector('#close-button').addEventListener('click', () => sd.remove());
+    });
+  }
+})();
+</script>
+</body></html>

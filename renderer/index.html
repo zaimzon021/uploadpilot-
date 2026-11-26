@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src http://127.0.0.1:* ; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'">
+  <title>UploadPilot</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="side">
+    <div class="logo"><div class="dot">▶</div>UploadPilot</div>
+    <nav class="nav">
+      <a data-page="dashboard" class="on">Dashboard</a>
+      <a data-page="channels">Channels</a>
+      <a data-page="settings">Settings</a>
+    </nav>
+    <div class="card keys" id="keysCard">
+      <div class="muted small">AI keys</div>
+      <div id="keysLine" style="margin-top:6px">Gemini · 0 keys</div>
+      <div class="muted small" id="keysCalls" style="margin-top:6px">0 calls today</div>
+    </div>
+  </aside>
+  <main class="main" id="main"></main>
+  <div id="modal" class="modal hidden"></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
