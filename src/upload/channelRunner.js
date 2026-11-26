@@ -113,7 +113,9 @@ class ChannelRunner extends EventEmitter {
         const onLost = key => { if (this.cloud && key === this.cloud.videoKey(cur)) { lost = true; log(`lease for video ${v.id} was taken over by another PC — stopping`); this.profiles.close(ch.profile_id).catch(() => {}); } };
         if (this.cloud) this.cloud.on('lease-lost', onLost);
         try {
-          if (cur.remote) {
+          const here = cur.remote && this.cloud && this.cloud.localCopy ? this.cloud.localCopy(cur) : null;
+          if (here) { file = here; log(`video ${v.id} is from ${cur.origin_pc_name || 'another PC'}: the same file (name + size) is on this PC at ${here} — using it`); }
+          else if (cur.remote) {
             live.state = 'downloading';
             log(`video ${v.id} is from ${cur.origin_pc_name || 'another PC'}: taking over, downloading the Drive copy`);
             this.events.info(`${ch.name}: taking over "${cur.title || cur.filename}" from ${cur.origin_pc_name || 'another PC'} (downloading backup)`, { channelId, kind: 'takeover' });

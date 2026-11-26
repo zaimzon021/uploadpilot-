@@ -46,6 +46,10 @@ class MemoryServer {
     if (['channels', 'profiles', 'videos', 'plans'].includes(coll)) {
       if (next.updatedAt !== now || typeof next.updatedBy !== 'string') throw new CloudError('permission-denied', 'Document must carry updatedAt=serverTimestamp and updatedBy');
       if (Object.keys(next).length > 64 && coll !== 'plans') throw new CloudError('permission-denied', 'Too many fields');
+      if (coll === 'profiles' && (next.stateVersion || 0) !== ((prev && prev.stateVersion) || 0)) {
+        const ap = this.docs.get(`users/${uid}/meta/activePc`);
+        if (ap && (ap.data.pcId !== next.updatedBy || ap.data.handedOver === true)) throw new CloudError('permission-denied', 'Only the active PC may change a saved login');
+      }
       if (coll === 'videos' && !['queued', 'writing', 'uploading', 'done', 'failed', 'skipped'].includes(next.status)) throw new CloudError('permission-denied', `Bad video status ${next.status}`);
     }
     if (coll === 'meta' && seg[3] === 'activePc' && (typeof next.pcId !== 'string' || next.renewedAt !== now)) throw new CloudError('permission-denied', 'activePc must carry pcId and renewedAt=serverTimestamp');

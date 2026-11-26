@@ -50,6 +50,7 @@ function statusPill(c) {
   return `<span class="pill ${cls}" title="${esc(c.status_reason || '')}">${label}${c.status === 'needs_you' && c.status_reason ? ' · ' + esc(c.status_reason) : ''}</span>`;
 }
 const videoPill = v => {
+  if (v.waiting_for) { const w = v.waiting_for; return `<span class="pill ${w.state === 'offline' || w.state === 'failed' ? 'r' : 'y'}" title="${esc(w.error || '')}">Waiting for file from ${esc(w.from)}${w.state === 'offline' ? ' (offline)' : w.state === 'uploading' ? ' (uploading to Drive)' : w.state === 'failed' ? ' (failed)' : ''}</span>`; }
   if (v.status === 'ready' && v.retry_at && v.retry_at > Date.now()) return `<span class="pill y" title="${esc(v.error || '')}">Retrying at ${hm(v.retry_at)} (attempt ${v.retry_count}/3)</span>`;
   const m = { queued: ['gr', 'Queued'], ai: ['b', 'AI writing'], awaiting_approval: ['y', 'Needs your OK'], ready: ['g', 'Ready'], uploading: ['b', 'Uploading'], done: ['g', 'Published'], failed: ['r', 'Failed'], missing: ['r', 'File missing'], skipped: ['gr', 'Skipped'] };
   const [c, l] = m[v.status] || ['gr', v.status];
@@ -98,6 +99,8 @@ async function doAction(action, arg) {
     case 'open-profile': toast('Opening profile…'); { const r = await api('POST', `/channels/${arg}/open-profile`); toast(r.signIn ? 'Sign in to Google in the window, then press Resume' : 'Profile window opened'); } break;
     case 'resume': await api('POST', `/channels/${arg}/resume`); toast('Resumed'); break;
     case 'retry': await api('POST', `/videos/${arg}/retry`); toast('Will upload at the next free slot'); break;
+    case 'check-signin': toast('Checking the sign-in…'); { const r = await api('POST', `/channels/${arg}/check-signin`); toast(r.signedIn ? 'Signed in ✓' : 'Still signed out — Open profile and sign in to Google'); } break;
+    case 'skip': await api('POST', `/videos/${arg}/skip`); toast('Skipped'); break;
     case 'takeover': await takeOverFlow(); break;
     case 'signin': showSignIn(true); return;
     case 'unlock': showUnlock(); return;
@@ -245,6 +248,7 @@ async function renderChannel(id) {
       <div class="field"><label>Description footer ${tip('Added under every description.')}</label><textarea id="sFooter" style="min-height:60px">${esc(st.footer)}</textarea></div>
       <div class="grid2"><div class="field"><label>Fixed hashtags</label><input id="sTags" value="${esc(st.hashtags)}" placeholder="#shorts #fails"></div>
         <div class="field"><label>Videos per day ${tip('Blank = the default from Settings.')}</label><input id="sPer" type="number" min="1" max="20" value="${st.perDay || ''}"></div></div>
+      <div class="field"><label><input type="checkbox" id="sBackup" style="width:auto" ${st.backupNew !== false ? 'checked' : ''}> Back up new videos to Google Drive right away ${tip('Each new video is copied to Drive soon after it is found (speed-capped, paused while this PC uploads to YouTube), so another PC can take over without waiting for this one.')}</label></div>
       <div class="field"><label>Folder</label><div style="display:flex;gap:8px"><input id="sFolder" value="${esc(c.folder || '')}"><button class="btn ghost" id="browse">Browse</button></div></div>
     </div>
     <div class="card" style="width:340px"><h2>Recent runs</h2>${runs.slice(0, 8).map(r => `<div style="margin-bottom:10px"><span class="pill ${r.result === 'ok' ? 'g' : r.result === 'running' ? 'b' : r.result === 'nothing_due' ? 'gr' : 'r'}">${esc(r.result)}</span> <span class="muted small">${new Date(r.started_at).toLocaleString()} · lane ${r.lane + 1}</span><div class="muted small">${esc(r.detail || '')}</div>${r.log_dir ? `<button class="btn link small" data-path="${esc(r.log_dir)}">Logs &amp; screenshots ›</button>` : ''}</div>`).join('') || '<div class="muted">No runs yet.</div>'}</div>
@@ -253,8 +257,8 @@ async function renderChannel(id) {
   bindActions(main);
   if ($('stopB')) $('stopB').onclick = guard(async () => { await api('POST', `/channels/${id}/stop`); render(); });
   $('scanB').onclick = guard(async () => { const r = await api('POST', `/channels/${id}/scan`); toast(`${r.added} new video(s)`); render(); });
-  const saveStyle = () => api('PATCH', `/channels/${id}`, { style: { niche: $('sNiche').value, language: $('sLang').value, mode: $('sMode').value, madeForKids: $('sKids').value === 'yes', footer: $('sFooter').value, hashtags: $('sTags').value, perDay: $('sPer').value ? +$('sPer').value : null } });
-  for (const f of ['sNiche', 'sLang', 'sMode', 'sKids', 'sFooter', 'sTags', 'sPer']) autosave($(f), saveStyle);
+  const saveStyle = () => api('PATCH', `/channels/${id}`, { style: { niche: $('sNiche').value, language: $('sLang').value, mode: $('sMode').value, madeForKids: $('sKids').value === 'yes', footer: $('sFooter').value, hashtags: $('sTags').value, perDay: $('sPer').value ? +$('sPer').value : null, backupNew: $('sBackup').checked } });
+  for (const f of ['sNiche', 'sLang', 'sMode', 'sKids', 'sFooter', 'sTags', 'sPer', 'sBackup']) autosave($(f), saveStyle);
   const saveFolder = autosave($('sFolder'), v => api('PATCH', `/channels/${id}`, { folder: v.trim() || undefined }), { delay: 1500 });
   $('browse').onclick = guard(async () => { const f = await window.uploadpilot.pickFolder(); if (f) { $('sFolder').value = f; await saveFolder(); } });
   main.querySelectorAll('[data-path]').forEach(b => b.onclick = () => window.uploadpilot.openPath(b.dataset.path));
@@ -338,6 +342,7 @@ async function renderSettings() {
           <div class="field"><label>Backup hours from</label><input id="cIdleS" type="time" value="${b.idleHours.start}"></div>
           <div class="field"><label>to</label><input id="cIdleE" type="time" value="${b.idleHours.end}"></div>
         </div>
+        <div class="field"><label><input type="checkbox" id="cIdleOnly" style="width:auto" ${b.idleHoursOnly ? 'checked' : ''}> Back up new videos only during these hours ${tip('Off: new videos go to Drive soon after they are found (channels with "Back up new videos" on). A file another PC needs right now is always sent at once.')}</label></div>
         ${cs.sync ? `<div class="muted small">Cloud today: ${cs.quota.reads} reads · ${cs.quota.writes} writes · PCs: ${cs.sync.pcs.map(p => esc(p.name) + (p.me ? ' (this PC)' : '')).join(', ')}</div>` : ''}
       </div>
     </div>
@@ -380,6 +385,7 @@ async function renderSettings() {
   autosave($('cSecret'), v => { if (!v.trim()) return null; return put({ cloud: { googleClientSecret: v.trim() } }).then(() => { $('cSecret').value = ''; }); }, { delay: 1500 });
   const bk = () => put({ cloud: { backup: { speedCapKBps: +$('cCap').value || 0, idleHours: { start: $('cIdleS').value, end: $('cIdleE').value } } } });
   autosave($('cCap'), bk); autosave($('cIdleS'), bk); autosave($('cIdleE'), bk);
+  autosave($('cIdleOnly'), v => put({ cloud: { backup: { idleHoursOnly: !!v } } }));
   if ($('pwGo')) $('pwGo').onclick = guard(async () => { await api('POST', '/cloud/password', { oldPassword: $('pwOld').value, newPassword: $('pwNew').value }); $('pwOld').value = $('pwNew').value = ''; toast('Password changed'); });
   $('checkAll').onclick = guard(async () => {
     const out = $('checkOut');

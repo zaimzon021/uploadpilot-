@@ -42,7 +42,7 @@ function fakeLauncher(calls = []) {
 /**
  * @returns {Promise<{app, name, uploads, calls}>}
  */
-async function makePc(server, drive, name, { email = 'owner@example.com', password = 'secret-pass', create = false, settings = {}, uploadMs = 50, uploads = [], driveConnected = true, singleActive = false, dataDir = null, activeOpts = {}, signIn = true } = {}) {
+async function makePc(server, drive, name, { email = 'owner@example.com', password = 'secret-pass', create = false, settings = {}, uploadMs = 50, uploads = [], driveConnected = true, singleActive = false, dataDir = null, activeOpts = {}, signIn = true, sameDisk = true, cloudOpts = {}, appOpts = {} } = {}) {
   const calls = [];
   const app = new UploadPilotApp({
     dataDir: dataDir || tmpDir(`pc-${name}-`), startApi: false, launcher: fakeLauncher(calls),
@@ -66,7 +66,10 @@ async function makePc(server, drive, name, { email = 'owner@example.com', passwo
       driveBaseUrl: drive && drive.base, googleEndpoints: drive && drive.endpoints,
       leaseOpts: { renewMs: 100 }, syncOpts: { pushMs: 80, activityFlushMs: 150 }, backupOpts: { tickMs: 3600e3 },
       activeOpts: { heartbeatMs: 150, staleMs: 1500, handoverTimeoutMs: 6000, handoverWaitMs: 3000, backupBudgetMs: 5000, ...activeOpts },
+      // all simulated PCs share this one disk: "the same file at the same path on this PC" (v0.3.2) is off unless a test asks for it
+      sameDisk, ...cloudOpts,
     },
+    ...appOpts,
   });
   await app.start({ api: false });
   await app.cloudReady;

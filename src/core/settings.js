@@ -62,7 +62,7 @@ const DEFAULTS = {
     googleClientId: '', googleClientSecret: '',   // OAuth Desktop client override; the secret itself is sealed in secrets.json (never stored here)
     pcId: '', pcName: '', lastEmail: '',
     emulator: { firestore: '', auth: '' },  // e.g. 127.0.0.1:8080 / http://127.0.0.1:9099 (development)
-    backup: { enabled: false, speedCapKBps: 0, speedCapPct: 30, measuredBps: 0, idleHours: { start: '01:00', end: '07:00' }, chunkMB: 8, deleteAfterUpload: true },
+    backup: { enabled: false, idleHoursOnly: false, speedCapKBps: 0, speedCapPct: 30, measuredBps: 0, idleHours: { start: '01:00', end: '07:00' }, chunkMB: 8, deleteAfterUpload: true },   // v0.3.2: channels back up new videos right away (style.backupNew, default on) unless idleHoursOnly (Advanced)
     takeoverGraceMin: 120,                  // another PC may take over a backed-up video this long after its slot
     leaseTtlSec: 120, leaseRenewSec: 30,
     writeBudget: 18000,                     // soft daily cap: above it, activity/plan docs stop syncing (Spark: 20k writes/day)

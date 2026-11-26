@@ -155,6 +155,8 @@ function normalizeStyle(st = {}) {
     mode: st.mode === 'approval' ? 'approval' : 'auto',
     visibility: ['PUBLIC', 'UNLISTED', 'PRIVATE'].includes(st.visibility) ? st.visibility : undefined,
     perDay: st.perDay ? Math.max(1, Math.min(20, +st.perDay)) : undefined,
+    // v0.3.2: back up new videos to Google Drive right after they are found (default on)
+    backupNew: !(st.backupNew === false || st.backupNew === 'false' || st.backupNew === 'no'),
   };
 }
 

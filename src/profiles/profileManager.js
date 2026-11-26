@@ -47,6 +47,7 @@ class ProfileManager {
     this._opening = new Map();
     // v0.3 cloud hooks (set by the app when cloud sync is on): profile lock + login snapshot sync
     //   beforeOpen(prof, purpose)  afterLaunch(prof, sess)  beforeClose(prof, sess)  afterClose(prof)
+    //   afterOpen(prof, sess)  (v0.3.2: the window is up and landed; the app starts its sign-in watch)
     this.hooks = null;
   }
   async _hook(name, ...args) { if (this.hooks && this.hooks[name]) return this.hooks[name](...args); }
@@ -155,19 +156,20 @@ class ProfileManager {
   session(id) { return this.sessions.get(id) || null; }
 
   /**
-   * Open a profile. purpose: 'manual' (normal window, for the user) | 'auto' (autopilot, minimized) | 'link'.
+   * Open a profile. purpose: 'manual' (normal window, for the user) | 'auto' (autopilot, minimized) | 'link'
+   * | 'keepalive' (daily visit) | 'check' (v0.3.2: quick headless sign-in check).
    * Runs a proxy health check first; refuses to open on a dead proxy (no IP leak).
    */
   async open(profileId, { purpose = 'manual', startUrl, skipProxyCheck = false, windowMode, headless } = {}) {
     if (this.sessions.has(profileId)) {
       const s = this.sessions.get(profileId);
-      if ((purpose === 'auto' || purpose === 'keepalive') && s.purpose !== purpose) throw Object.assign(new Error('Profile is open for manual use'), { code: 'PROFILE_BUSY' });
+      if ((purpose === 'auto' || purpose === 'keepalive' || purpose === 'check') && s.purpose !== purpose) throw Object.assign(new Error('Profile is open for manual use'), { code: 'PROFILE_BUSY' });
       if (s.handle.isClosed()) { await this.close(profileId); } else return s;
     }
     if (this._opening.has(profileId)) return this._opening.get(profileId);
     // load rule: never more browsers than lanes (autopilot waits; manual windows count too)
     const maxBrowsers = Math.max(1, this.settings.get('lanes') || 3);
-    if ((purpose === 'auto' || purpose === 'keepalive') && this.sessions.size + this._opening.size >= maxBrowsers) throw Object.assign(new Error(`Browser limit reached (${maxBrowsers} open)`), { code: 'BROWSER_LIMIT' });
+    if ((purpose === 'auto' || purpose === 'keepalive' || purpose === 'check') && this.sessions.size + this._opening.size >= maxBrowsers) throw Object.assign(new Error(`Browser limit reached (${maxBrowsers} open)`), { code: 'BROWSER_LIMIT' });
     const p = (async () => {
       const prof = this.getProfile(profileId);
       if (!prof) throw new Error(`Profile ${profileId} not found`);
@@ -196,7 +198,7 @@ class ProfileManager {
       try {
         handle = await this.launcher({
           userDataDir: prof.data_dir, proxyUrl: bridge ? bridge.url : null, cfg,
-          windowMode: windowMode || (purpose === 'auto' || purpose === 'keepalive' ? cfg.windowMode : 'normal'),
+          windowMode: windowMode || (purpose === 'auto' || purpose === 'keepalive' || purpose === 'check' ? cfg.windowMode : 'normal'),
           headless: headless ?? cfg.headless,
         });
       } catch (e) { if (bridge) await bridge.stop(); throw e; }
@@ -205,19 +207,20 @@ class ProfileManager {
       handle.context.on('close', () => {
         if (this.sessions.get(profileId) === sess) {
           this.sessions.delete(profileId); clearInterval(sess.snapTimer); if (bridge) bridge.stop();
+          if (sess.watch) setTimeout(() => sess.watch && sess.watch.stop(), 50);   // let the watch judge the last cookies first
           this._hook('afterClose', prof).catch(() => {});           // window closed by hand: free the lock
         }
       });
       this.db.run('UPDATE profiles SET last_opened=? WHERE id=?', Date.now(), profileId);
       // newer login from another PC is imported before anything navigates
       await this._hook('afterLaunch', prof, sess);
-      if (purpose !== 'auto' && purpose !== 'keepalive' && this.hooks && this.hooks.beforeClose) {
+      if (purpose !== 'auto' && purpose !== 'keepalive' && purpose !== 'check' && this.hooks && this.hooks.beforeClose) {
         // a hand-used window may be closed with the X button (no chance to export then): snapshot now and then
         const every = Math.max(1, cfg.snapshotEveryMin || 3) * 60000;
         sess.snapTimer = setInterval(() => { if (!sess.handle.isClosed()) this._hook('beforeClose', prof, sess).catch(() => {}); }, every);
         if (sess.snapTimer.unref) sess.snapTimer.unref();
       }
-      this.events.info(`Profile #${prof.number} opened${purpose === 'auto' ? '' : purpose === 'keepalive' ? ' (daily keep-alive)' : ` (${purpose})`}${sess.exitIp ? ` · exit IP ${sess.exitIp}` : ''}`, { kind: 'profile' });
+      this.events.info(`Profile #${prof.number} opened${purpose === 'auto' ? '' : purpose === 'keepalive' ? ' (daily keep-alive)' : purpose === 'check' ? ' (sign-in check)' : ` (${purpose})`}${sess.exitIp ? ` · exit IP ${sess.exitIp}` : ''}`, { kind: 'profile' });
       if (startUrl) {
         const page = handle.context.pages()[0] || await handle.context.newPage();
         sess.landing = await gotoLanding(page, startUrl);
@@ -227,6 +230,7 @@ class ProfileManager {
           this.db.run(`UPDATE profiles SET login_state='signed_out', login_note=? WHERE id=?`, 'Sign in needed', profileId);
         }
       }
+      await this._hook('afterOpen', prof, sess).catch(() => {});
       return sess;
     }
   }
@@ -236,6 +240,7 @@ class ProfileManager {
     if (!s) return false;
     this.sessions.delete(profileId);
     clearInterval(s.snapTimer);
+    if (s.watch) { await s.watch.check('closing').catch(() => {}); s.watch.stop(); }   // a sign-in made just before closing still counts
     const prof = this.getProfile(profileId) || { id: profileId, number: s.number };
     await this._hook('beforeClose', prof, s).catch(() => {});   // save the login to the cloud if it changed
     try { await s.handle.close(); } catch (_) { /* ignore */ }

@@ -86,6 +86,10 @@ class DB {
     // v0.3.1: automatic retry of failed uploads, where the metadata came from, login health per profile
     add('videos', [['retry_at', 'INTEGER'], ['retry_count', 'INTEGER DEFAULT 0'], ['error_kind', 'TEXT'], ['meta_source', 'TEXT']]);
     add('profiles', [['login_state', 'TEXT'], ['login_note', 'TEXT'], ['keepalive_at', 'INTEGER']]);
+    // v0.3.2: which version failed a job (stale code-crash failures are re-queued after an upgrade),
+    // a copy of another PC's video found on this PC, Google sign-in flag of the newest cloud login
+    add('videos', [['failed_version', 'TEXT'], ['local_path', 'TEXT']]);
+    add('profiles', [['cloud_state_google', 'INTEGER']]);
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_cloud ON channels(cloud_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_cloud ON profiles(cloud_id);
@@ -110,7 +114,7 @@ class DB {
         BEGIN INSERT OR REPLACE INTO sync_tombstones(kind, cloud_id, ts) VALUES ('${t}', OLD.cloud_id, CAST(strftime('%s','now') AS INTEGER) * 1000); END;`);
     trig('channels', 'name, handle, yt_channel_id, folder, style, status, status_reason, paused_until, profile_id, last_run');
     trig('profiles', 'number, name, proxy_id');
-    trig('videos', 'status, scheduled_at, title, description, tags, hashtags, edited, ai_status, ai_error, url, error, attempts, uploaded_at, drive_file_id, filename, size, retry_at, retry_count, error_kind');
+    trig('videos', 'status, scheduled_at, title, description, tags, hashtags, edited, ai_status, ai_error, url, error, attempts, uploaded_at, drive_file_id, filename, size, retry_at, retry_count, error_kind, failed_version');
   }
 
   /** Run fn with change tracking off (used when applying changes that came from the cloud). */

@@ -85,6 +85,7 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
     const s = await app.profiles.open(ch.profile_id, { purpose: 'manual', startUrl: app.settings.get('urls').studio });
     return { profileId: ch.profile_id, ws: s.cdpEndpoint, exitIp: s.exitIp, signIn: !!(s.landing && s.landing.signIn), url: s.landing ? s.landing.url : null };
   });
+  add('POST', `${P}/channels/:id/check-signin`, async ({ p }) => need(await app.checkSignIn(int(p.id))));
   add('GET', `${P}/channels/:id/videos`, ({ p }) => app.listVideos(int(p.id)));
   add('GET', `${P}/channels/:id/runs`, ({ p }) => app.db.all('SELECT * FROM runs WHERE channel_id=? ORDER BY id DESC LIMIT 50', int(p.id)));
   // ---- videos

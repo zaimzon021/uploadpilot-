@@ -18,6 +18,7 @@ const { BackupWorker } = require('./backup');
 const { KeyManager } = require('./keys');
 const { ActivePc } = require('./activePc');
 const { AccountSync } = require('./accountSync');
+const { FileRequests } = require('./fileRequests');
 const { withTimeout } = require('./store/common');
 
 const REQUIRED_FB = ['apiKey', 'projectId', 'appId'];
@@ -222,10 +223,13 @@ class CloudService extends EventEmitter {
     this.sync = new CloudSync({ app: this.app, store: this.store, root: this.root, pcId: this.pcId, pcName: this.pcName, keys: this.keys, onChange: () => this.emit('change'), ...(this.o.syncOpts || {}) });
     this.sync.onRemoteDone = id => this.app.onRemoteDone && this.app.onRemoteDone(id);
     this.sync.onVideosChanged = () => this.app.onVideosChanged && this.app.onVideosChanged();
+    this.sync.onProfileState = (id, d) => this.onRemoteLogin(id, d);
     await this.sync.start();
-    this.profileState = new ProfileStateSync({ db: this.app.db, drive: () => this.drive(), keys: this.keys, store: this.store, root: () => this.root, pcId: this.pcId, pcName: this.pcName, log: (lvl, m, detail) => this.app.events.log(lvl, m, { kind: 'cloud', detail }) });
+    this.profileState = new ProfileStateSync({ db: this.app.db, drive: () => this.drive(), keys: this.keys, store: this.store, root: () => this.root, pcId: this.pcId, pcName: this.pcName, log: (lvl, m, detail) => this.app.events.log(lvl, m, { kind: 'cloud', detail }),
+      singleActive: () => this.singleActive, isActive: () => !!(this.activePc && this.activePc.isActive) });
     this.backup = new BackupWorker({ app: this.app, cloud: this, ...(this.o.backupOpts || {}) });
     this.backup.start();
+    this.files = new FileRequests({ app: this.app, cloud: this, store: this.store, root: () => this.root, pcId: this.pcId, pcName: this.pcName, ...(this.o.fileOpts || {}) }).start();
     this._staleTimer = setInterval(() => this.recoverStale(), 60000);
     if (this._staleTimer.unref) this._staleTimer.unref();
     this.state = 'online';
@@ -256,6 +260,7 @@ class CloudService extends EventEmitter {
       else if (c.id === 'keyRequest') { if (this.keys) this.keys.onRequestDoc(d).then(got => { if (got) this._afterUnlock(); }).catch(() => {}); }
       else if (c.id === 'settings') { if (this.account) this.account.apply(d); }
       else if (c.id === 'drive') { if (this.account) this.account.applyDrive(d); }
+      else if (c.id.startsWith('file_')) { if (this.files) this.files.onDoc(c.id, d); }
     }
     this.emit('change');
   }
@@ -345,6 +350,7 @@ class CloudService extends EventEmitter {
     clearInterval(this._staleTimer);
     if (this._metaUnsub) { try { this._metaUnsub(); } catch (_) { /* ignore */ } this._metaUnsub = null; }
     if (this.activePc) { this.activePc.stop(); this.activePc = null; }
+    if (this.files) { this.files.stop(); this.files = null; }
     if (this.account) { this.account.stop(); this.account = null; }
     if (this.backup) { await this.backup.stop(); this.backup = null; }
     if (this.sync) { await this.sync.stop().catch(() => {}); this.sync = null; }
@@ -429,10 +435,26 @@ class CloudService extends EventEmitter {
   videoKey(v) { return `video_${v.cloud_id}`; }
   profileKey(p) { return `profile_${p.cloud_id}`; }
 
+  /**
+   * v0.3.2: another PC's video that is also on this PC: the same folder path (folders are per PC, but
+   * the same path may exist here) or a folder linked here, with a file of the same name and size.
+   */
+  localCopy(v) {
+    if (!v || !v.remote || this.o.sameDisk) return null;       // sameDisk: simulated PCs in tests share one disk
+    const ch = this.app.db.get('SELECT folder, cloud_shadow FROM channels WHERE id=?', v.channel_id) || {};
+    let owner = null; try { owner = JSON.parse(ch.cloud_shadow || '{}').folder || null; } catch (_) { /* ignore */ }
+    const cands = [v.local_path, owner && path.join(owner, v.filename), ch.folder && path.join(ch.folder, v.filename)].filter(Boolean);
+    for (const f of cands) {
+      try { const st = fs.statSync(f); if (st.isFile() && (!v.size || st.size === v.size)) return f; } catch (_) { /* not here */ }
+    }
+    return null;
+  }
+
   /** Can this PC upload this video now? Local file: yes. Another PC's file: only as a take-over. */
   runnableHere(v, now = Date.now()) {
     if (!v.remote) return true;
-    if (!this.online || !this.leases || !v.drive_file_id || !v.cloud_id) return false;
+    if (!this.online || !this.leases || !v.cloud_id) return false;
+    if (!v.drive_file_id && !this.localCopy(v)) return false;          // waiting for the file (fileRequests.js)
     if (this.leases.holder(this.videoKey(v))) return false;
     if (this.recovered.has(v.cloud_id)) return true;
     // single active PC: the other PCs are not uploading, so a backed-up video runs here at its time
@@ -514,15 +536,36 @@ class CloudService extends EventEmitter {
     if (r && r.imported) {
       sess.restored = r;
       // after a restore: is the Google account really signed in? (youtube.com, in a throw-away tab)
-      if (this.cfg.verifyAfterRestore !== false) await this.app.checkSignedIn(prof, sess, { log: true }).catch(() => {});
+      if (this.cfg.verifyAfterRestore !== false && sess.purpose !== 'check') await this.app.checkSignedIn(prof, sess, { log: true, via: 'restore' }).catch(() => {});
     }
   }
-  async beforeCloseProfile(prof, sess) {
-    if (!this.online || !this.profileState || sess.noExport || !sess.handle || (sess.handle.isClosed && sess.handle.isClosed())) return;
+  async beforeCloseProfile(prof, sess) { return this.exportLogin(prof, sess, { reason: sess.exportReason || 'close' }); }
+
+  /** Only the active PC writes logins (v0.3.2): a PC that lost / handed over the role never exports. */
+  mayExportLogin() { return this.online && !!this.profileState && (!this.singleActive || !!(this.activePc && this.activePc.isActive)); }
+
+  /** Save this window's login to the cloud when it changed. force: a sign-in was just confirmed here. */
+  async exportLogin(prof, sess, { reason = 'close', force = false } = {}) {
+    if (!this.online || !this.profileState || !sess || sess.noExport || !sess.handle || (sess.handle.isClosed && sess.handle.isClosed())) return null;
+    if (!this.mayExportLogin()) { if (!sess._notActiveLogged) { sess._notActiveLogged = true; this.app.events.info(`Profile #${prof.number}: login not saved here — this PC is not the active one`, { kind: 'profile' }); } return { exported: false, refused: 'not the active PC' }; }
     const fresh = this.app.db.get('SELECT * FROM profiles WHERE id=?', prof.id);
-    if (!fresh) return;
-    try { await withTimeout(this.profileState.exportIfChanged(fresh, sess.handle.context, { reason: sess.exportReason || 'close' }), 90000, 'profile login export'); }
-    catch (e) { this.app.events.warn(`Profile #${prof.number}: login not saved to the cloud — ${e.message}`, { kind: 'cloud', detail: e.stack }); }
+    if (!fresh) return null;
+    try { return await withTimeout(this.profileState.exportIfChanged(fresh, sess.handle.context, { reason, force }), 90000, 'profile login export'); }
+    catch (e) { this.app.events.warn(`Profile #${prof.number}: login not saved to the cloud — ${e.message}`, { kind: 'cloud', detail: e.stack }); return null; }
+  }
+
+  /**
+   * v0.3.2: a newer login arrived live (onSnapshot) from another PC. The active PC imports it now when
+   * the profile waits for a sign-in (and re-checks it); otherwise the next open imports it as before.
+   */
+  onRemoteLogin(profileId, d) {
+    if (!d || d.updatedBy === this.pcId || !this.online) return;
+    const p = this.app.db.get('SELECT * FROM profiles WHERE id=?', profileId);
+    if (!p || !(d.stateVersion > (p.state_version || 0))) return;
+    if (!this.singleActive || !this.mayRun() || !this.app.importLoginNow) return;   // not the active PC: imported when it becomes active / opens it
+    if (this.app.profiles.isOpen(p.id)) return;                    // never under an open window: its next open imports it
+    const verify = this.app.loginImportNeeded(p);                  // waiting for a sign-in: import + re-check (clears a stale flag)
+    this.app.importLoginNow(p.id, { reason: `newer login from ${d.stateBy || 'another PC'}`, verify }).catch(() => {});
   }
   async afterCloseProfile(prof) { if (this.leases && prof.cloud_id) await this.leases.release(this.profileKey(prof)); }
 
@@ -548,7 +591,8 @@ class CloudService extends EventEmitter {
       quota: this.store ? this.store.stats.snapshot() : null,
       leases: this.leases ? this.leases.active().map(l => ({ key: l.key, kind: l.kind, pcName: l.pcName, me: l.pcId === this.pcId, state: l.state || null, title: l.title || null })) : [],
       clockOffsetMs: this.leases ? this.leases.offsetMs : 0,
-      profileSync: this.profileState ? { exports: this.profileState.exports, imports: this.profileState.imports, unchanged: this.profileState.skipped } : null,
+      profileSync: this.profileState ? { exports: this.profileState.exports, imports: this.profileState.imports, unchanged: this.profileState.skipped, refused: this.profileState.refused } : null,
+      files: this.files ? { requested: this.files.requested, served: this.files.served, open: this.files.docs.size } : null,
     };
   }
 }

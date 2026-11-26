@@ -1,4 +1,36 @@
-# TESTING — UploadPilot v0.3.1
+# TESTING — UploadPilot v0.3.2
+
+## v0.3.2 results (2026-11-26)
+
+Same sandbox (Linux arm64, Node 22.23, playwright-core 1.65 + Chromium 1255, Firebase emulators on Java 21). Each test file was run on its own. **No real Google/Firebase/Drive sign-in was made.**
+
+| Suite | File | Tests | Pass |
+|---|---|---|---|
+| Unit, 0.3.0 + 0.3.1 suites | `test/unit/*` (16 files) | 87 | 87 |
+| **0.3.2**: SignInWatch (cookies, Studio URL, tab/window close); signed in by hand in an open window → flag + Needs you cleared, exported as v+1 over a stray newer copy, "signed in ✓", channel due again; **Check sign-in** (headless); stale flag: newer cloud login imported + re-checked on becoming active and **live via onSnapshot** (also imported when nothing waits for it); **only the active PC writes logins** (local, transaction, rules); **upgrade re-queues old code-crash failures**; file on another PC: priority backup on request, owner offline → Needs you + Skip → served when back, Drive backup on demand, same path used directly, relinked folder adopted (no duplicates), 0.3.1 "missing" → waiting; back up new videos right away / idle-hours-only / off per channel | `v032.test.js` | 11 | 11 |
+| **Unit total** (`npm test`) | | **98** | **98** |
+| E2E, 0.3.1 suites (api, upload-engine, failures, socks-bridge, autopilot, profile-state, journey, renderer-channels) | `test/e2e/*` | 36 | 36 |
+| **0.3.2 real Chromium**: a sign-in in an open window is noticed by itself; Check sign-in runs a real headless check | `signin-watch.test.js` | 2 | 2 |
+| **E2E total** | | **38** | **38** |
+| Firebase Emulator (real SDK + real rules), incl. **0.3.2 rule: only the active PC may change `stateVersion`** | `firestore-emulator.test.js` | 4 | 4 |
+
+**Total: 140 automated tests, all passing.** Electron smoke was not run (this sandbox has no GTK); the Windows CI build packages the app.
+
+Root causes fixed in 0.3.2:
+* **"Signed in again but it still says Sign in needed"**: the flag was only cleared by a successful login export, and that export was refused because the cloud held a *newer* version (v3) written by DESKTOP-MDM36KB, a PC that was no longer active. Nothing else ever looked at the window. Now the window itself is watched, a confirmed sign-in on the active PC replaces the stray copy, and only the active PC may write logins.
+* **A non-active PC wrote login v3**: exports only checked "signed in to the cloud", not "active PC"; a PC that lost the role (asleep, or a forced take-over while it was still winding down) kept its window and its 3-minute snapshot timer. Now blocked locally, in the transaction and by the rules.
+* **Stale "Cannot read properties of null (reading 'replace')"**: a 0.3.0 crash left the job `failed`; 0.3.1 fixed the code but never revisited old failures.
+* **"File is missing" on the active PC**: the file only exists on DESKTOP-MDM36KB; backups were off / idle-hours-only, and there was no way to ask that PC for the file, so the job ended as missing/failed instead of waiting.
+
+### v0.3.2 — needs live verification
+1. **Re-publish `firestore.rules`** (new profile rule). Until then the app's own checks still apply, but an older app version on another PC could still write a login.
+2. Sign-in detection against real Google: cookie names (`SID`/`__Secure-1PSID` on .google.com, `LOGIN_INFO`/`SID` on .youtube.com) and Studio URLs.
+3. The priority file request between two real PCs (the PC with the file must be signed in to UploadPilot; a PC that handed over signs out and counts as offline until signed in again).
+4. Drive usage with "Back up new videos right away" on by default (backups are deleted after publishing).
+
+---
+
+# v0.3.1 test notes
 
 ## v0.3.1 results (2026-11-26)
 

@@ -142,6 +142,7 @@ class CloudSync {
       title: r.title, description: r.description, tags: parse(r.tags, []), hashtags: parse(r.hashtags, []), edited: !!r.edited,
       aiStatus: r.ai_status, aiError: r.ai_error, url: r.url, error: r.error, attempts: r.attempts || 0, uploadedAt: r.uploaded_at,
       retryAt: r.retry_at || null, retryCount: r.retry_count || 0, errorKind: r.error_kind || null,
+      failedVersion: r.failed_version || null,
       driveFileId: r.drive_file_id, createdAt: r.created_at,
     };
   }
@@ -267,7 +268,11 @@ class CloudSync {
     this._relink();
   }
   _applyProfileState(row, d) {
-    if (d.stateVersion && d.stateVersion !== row.cloud_state_version) this.db.run('UPDATE profiles SET cloud_state_version=?, cloud_state_hash=?, cloud_state_file=?, cloud_state_by=? WHERE id=?', d.stateVersion, d.stateHash || null, d.stateFileId || null, d.stateBy || null, row.id);
+    if (d.stateVersion && d.stateVersion !== row.cloud_state_version) {
+      this.db.run('UPDATE profiles SET cloud_state_version=?, cloud_state_hash=?, cloud_state_file=?, cloud_state_by=?, cloud_state_google=? WHERE id=?', d.stateVersion, d.stateHash || null, d.stateFileId || null, d.stateBy || null, d.stateGoogle ?? null, row.id);
+      // v0.3.2: a newer login arrived live (onSnapshot): the active PC imports it / clears a stale flag
+      if (this.onProfileState && d.updatedBy !== this.pcId) { const id = row.id; setImmediate(() => { try { this.onProfileState(id, d); } catch (_) { /* ignore */ } }); }
+    }
   }
   _proxyPw(p) { if (!p || !p.passwordEnc) return ''; if (!this.keys || !this.keys.ready) return null; try { return this.keys.decString(p.passwordEnc); } catch (_) { return null; } }
   _ensureProxy(p) {
@@ -344,7 +349,7 @@ class CloudSync {
             VALUES(?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,0)`,
             ch.id, `cloud:${c.id}`, d.filename || 'video', d.size || 0, detail, d.scheduledAt ?? null, d.aiStatus || 'pending', d.aiError || null, d.title || null, d.description || null, JSON.stringify(d.tags || []), JSON.stringify(d.hashtags || []), d.edited ? 1 : 0, d.url || null, d.attempts || 0, d.error || null, d.createdAt || Date.now(), d.uploadedAt || null, c.id, d.originPc || null, d.originPcName || null, d.driveFileId || null);
           if (!remote) this.app.events.warn(`Video ${d.filename} is listed in the cloud as from this PC but isn't in the local database — kept as a cloud copy`, { kind: 'sync' });
-          if (r.changes) { const shadow = { ...d }; delete shadow.updatedAt; delete shadow.updatedBy; this.db.run('UPDATE videos SET cloud_shadow=? WHERE cloud_id=?', JSON.stringify(shadow), c.id); }
+          if (r.changes) { const shadow = { ...d }; delete shadow.updatedAt; delete shadow.updatedBy; this.db.run('UPDATE videos SET cloud_shadow=?, failed_version=?, retry_at=?, retry_count=?, error_kind=? WHERE cloud_id=?', JSON.stringify(shadow), d.failedVersion || null, d.retryAt || null, d.retryCount || 0, d.errorKind || null, c.id); }
           this.counters.appliedDocs++;
           continue;
         }
@@ -369,6 +374,7 @@ class CloudSync {
         if (ok.includes('retryAt')) set('retry_at', d.retryAt || null);
         if (ok.includes('retryCount')) set('retry_count', d.retryCount || 0);
         if (ok.includes('errorKind')) set('error_kind', d.errorKind || null);
+        if (ok.includes('failedVersion')) set('failed_version', d.failedVersion || null);
         if (ok.includes('scheduledAt') || ok.includes('retryAt') || ok.includes('detail')) this._videosTouched = true;
         if (sets.length) this.db.run(`UPDATE videos SET ${sets.join(', ')} WHERE id=?`, ...vals, row.id);
         this.db.run('UPDATE videos SET cloud_shadow=? WHERE id=?', JSON.stringify(this._newShadow(row, d, this._fieldsChanged(d, parse(row.cloud_shadow, null)).filter(k => !ok.includes(k)))), row.id);

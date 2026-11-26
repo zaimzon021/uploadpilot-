@@ -1,8 +1,10 @@
 rules_version = '2';
-// UploadPilot v0.3.1 — every document lives under users/{uid}; only that signed-in user can touch it.
+// UploadPilot v0.3.2 — every document lives under users/{uid}; only that signed-in user can touch it.
 // Leases (job + profile locks) are the only documents with extra rules: they must carry the server
 // time (renewedAt == request.time), and another PC may only take one over once it has expired by the
 // SERVER clock, so a PC with a wrong local clock can never steal a live lease.
+// v0.3.2: a profile's saved login (stateVersion) may only be changed by the ACTIVE PC
+// (meta/activePc.pcId == updatedBy, not handed over), so a PC that lost the active role can't overwrite it.
 service cloud.firestore {
   match /databases/{database}/documents {
     function owner(uid) {
@@ -14,6 +16,16 @@ service cloud.firestore {
     function stamped() {
       return request.resource.data.updatedAt == request.time && request.resource.data.updatedBy is string;
     }
+    function activePcPath(uid) {
+      return /databases/$(database)/documents/users/$(uid)/meta/activePc;
+    }
+    // login snapshot unchanged, or no active-PC doc (offline/0.3.0 mode), or written by the active PC
+    function loginWriteOk(uid) {
+      return request.resource.data.get('stateVersion', 0) == (resource == null ? 0 : resource.data.get('stateVersion', 0))
+        || !exists(activePcPath(uid))
+        || (get(activePcPath(uid)).data.pcId == request.resource.data.updatedBy
+            && get(activePcPath(uid)).data.get('handedOver', false) != true);
+    }
 
     match /users/{uid} {
       allow read, write: if owner(uid);
@@ -24,7 +36,7 @@ service cloud.firestore {
       }
       match /profiles/{id} {
         allow read, delete: if owner(uid);
-        allow create, update: if owner(uid) && small() && stamped();
+        allow create, update: if owner(uid) && small() && stamped() && loginWriteOk(uid);
       }
       match /videos/{id} {
         allow read, delete: if owner(uid);

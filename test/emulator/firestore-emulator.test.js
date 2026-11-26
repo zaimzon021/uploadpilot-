@@ -113,3 +113,26 @@ test('emulator v0.3.1: meta/activePc rule (pcId + server time), account key, res
   assert.deepStrictEqual(B.settings.get('geminiKeys'), ['AIza-em-key']);
   await B.stop();
 });
+
+test('emulator (v0.3.2 rules): only the active PC may change a profile\'s saved login (stateVersion); other fields still sync', { skip: !ON && 'FIRESTORE_EMULATOR_HOST not set', timeout: 30000 }, async () => {
+  const a = store();
+  const u = await a.auth.signUp('login' + email, 'secret123');
+  const root = `users/${u.uid}`;
+  const P = `${root}/profiles/p1`;
+  const stamp = by => ({ updatedAt: a.SERVER_TS, updatedBy: by });
+  // no active-PC doc yet (offline / 0.3.0 accounts): allowed
+  await a.set(P, { number: 1, name: 'One', stateVersion: 1, ...stamp('pcA') });
+  await a.set(`${root}/meta/activePc`, { pcId: 'pcR', pcName: 'RDP', since: a.SERVER_TS, renewedAt: a.SERVER_TS, handedOver: false });
+  // DESKTOP (not active) tries to write login v2: denied
+  await assert.rejects(a.set(P, { stateVersion: 2, stateFileId: 'f2', ...stamp('pcD') }, { merge: true }), e => e.code === 'permission-denied');
+  // ...but may still sync a name change (stateVersion unchanged)
+  await a.set(P, { name: 'Renamed', ...stamp('pcD') }, { merge: true });
+  // the active PC may write the login
+  await a.set(P, { stateVersion: 2, stateFileId: 'f2', ...stamp('pcR') }, { merge: true });
+  // after it handed over, not even the old active PC may
+  await a.set(`${root}/meta/activePc`, { pcId: 'pcR', pcName: 'RDP', renewedAt: a.SERVER_TS, handedOver: true }, { merge: true });
+  await assert.rejects(a.set(P, { stateVersion: 3, ...stamp('pcR') }, { merge: true }), e => e.code === 'permission-denied');
+  const d = await a.get(P);
+  assert.strictEqual(d.stateVersion, 2); assert.strictEqual(d.name, 'Renamed');
+  await a.close();
+});

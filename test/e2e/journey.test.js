@@ -48,6 +48,7 @@ async function startPc(name) {
     cloud: {
       ...(EMU ? {} : { storeFactory: () => new MemoryStore(server, { name }) }),
       driveBaseUrl: drive.base, googleEndpoints: drive.endpoints,
+      sameDisk: true,   // both simulated PCs share this disk: PC2 must not "find" PC1's file at the same path
       syncOpts: { pushMs: 300, activityFlushMs: 1000 }, leaseOpts: { renewMs: 1000 },
       activeOpts: { heartbeatMs: 1000, staleMs: 8000, handoverTimeoutMs: 40000, handoverWaitMs: 20000, backupBudgetMs: 20000 },
     },

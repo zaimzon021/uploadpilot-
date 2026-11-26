@@ -23,6 +23,18 @@ const { missingFields, isComplete, fallbackMeta } = require('../upload/metadata'
 const { KeepAlive } = require('../profiles/keepAlive');
 const { gotoLanding } = require('../profiles/profileManager');
 const { googleAuthCookies } = require('../cloud/profileState');
+const { SignInWatch } = require('../profiles/signInWatch');
+const VERSION = require('../../package.json').version;
+
+/** Channel reasons that a Google sign-in fixes. */
+const isLoginReason = r => /login|log in|sign.?in|signed out|session expired/i.test(String(r || ''));
+/** Errors that were bugs in the app (not YouTube / network): re-queued after an upgrade. */
+const CODE_CRASH = /Cannot read propert(?:y|ies) of (?:null|undefined)|is not a function|is not defined|is not iterable|of undefined \(reading|TypeError|ReferenceError/i;
+function versionLt(a, b) {
+  const pa = String(a || '0').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '0').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0); }
+  return false;
+}
 
 /** Short, plain reason for the activity feed. */
 function humanizeError(msg) {
@@ -66,7 +78,8 @@ class UploadPilotApp {
       beforeOpen: (prof, purpose) => this.cloud.beforeOpenProfile(prof, purpose),
       afterLaunch: (prof, sess) => this.cloud.afterLaunchProfile(prof, sess),
       beforeClose: (prof, sess) => this.cloud.beforeCloseProfile(prof, sess),
-      afterClose: prof => this.cloud.afterCloseProfile(prof),
+      afterClose: async prof => { await this.cloud.afterCloseProfile(prof); if (this.scheduler) this.scheduler.wake(); },
+      afterOpen: (prof, sess) => this._watchSignIn(prof, sess),
     };
     this.wizard = new LinkWizard(this);
     this.watchers = new Map();
@@ -83,6 +96,7 @@ class UploadPilotApp {
     // (cloud copies of other PCs' videos are left alone: their own PC or a lease expiry handles them)
     this.db.run(`UPDATE videos SET status='ready' WHERE status='uploading' AND remote=0`);
     this.db.run(`UPDATE videos SET status='queued', ai_status='pending' WHERE status='ai' AND remote=0`);
+    try { this.resetStaleFailures(); } catch (e) { this.events.warn(`Re-queue of old failures: ${e.message}`); }
     this.cacheDir = path.join(this.dataDir, 'cache');
     this._rotate();
     this._rotateTimer = setInterval(() => this._rotate(), 6 * 3600e3);
@@ -99,11 +113,11 @@ class UploadPilotApp {
     if (!this.settings.get('autopilotPaused')) this.scheduler.start();
     this._aiTimer = setInterval(() => this.aiTick().catch(e => this.events.error(`AI worker: ${e.message}`)), this.settings.get('aiTickMs'));
     this.keepAlive.start();
-    this._planTimer = setInterval(() => this.replanAll(), 15 * 60000);
+    this._planTimer = setInterval(() => { this.replanAll(); try { this.resetStaleFailures(); } catch (_) { /* ignore */ } }, 15 * 60000);
     setTimeout(() => this.aiTick().catch(() => {}), 500);
     this.events.info(`UploadPilot started (db: ${this.db.driver})`, { kind: 'app' });
     // cloud sign-in / sync starts in the background; the app works locally meanwhile
-    this.cloudReady = this.cloud.start().then(st => { if (this.scheduler) this.scheduler.wake(); this.aiKick(); return st; })
+    this.cloudReady = this.cloud.start().then(st => { if (this.scheduler) this.scheduler.wake(); this.aiKick(); this._afterCloudUp(); return st; })
       .catch(e => { this.events.error(`Cloud: ${e.message}`, { kind: 'cloud' }); return this.cloud.status(); });
     this.cloud.on('change', () => this.events.emit('cloud', { ts: Date.now() }));
   }
@@ -194,7 +208,18 @@ class UploadPilotApp {
 
   /** A time / status changed (here or on another PC): the scheduler and the AI queue look again now. */
   onVideosChanged() { if (this.scheduler) this.scheduler.wake(); this.aiKick(); }
-  onBecameActive() { if (this.scheduler) { if (!this.scheduler.running && !this.settings.get('autopilotPaused')) this.scheduler.start(); this.scheduler.wake(); } this.aiKick(); }
+  onBecameActive() { if (this.scheduler) { if (!this.scheduler.running && !this.settings.get('autopilotPaused')) this.scheduler.start(); this.scheduler.wake(); } this.aiKick(); this._afterCloudUp(); }
+
+  /** Cloud is up / this PC became active: old failures from other PCs, logins that arrived while away. */
+  _afterCloudUp() {
+    clearTimeout(this._upT);
+    this._upT = setTimeout(() => {
+      if (!this.started) return;
+      try { this.resetStaleFailures(); } catch (_) { /* ignore */ }
+      this.importPendingLogins().catch(() => {});
+    }, this.o.afterCloudUpMs ?? 3000);
+    if (this._upT.unref) this._upT.unref();
+  }
 
   /** Scan the channel folder, add new videos, then plan. */
   ingest(channelId) {
@@ -204,6 +229,7 @@ class UploadPilotApp {
     let added = 0;
     this.db.tx(() => {
       for (const f of files) {
+        if (this._adoptRemote(channelId, f.path, f.filename, f.size)) continue;
         const r = this.db.run('INSERT OR IGNORE INTO videos(channel_id,path,thumb,filename,size,status,created_at) VALUES(?,?,?,?,?,?,?)', channelId, f.path, f.thumb, f.filename, f.size, 'queued', Date.now());
         added += r.changes;
         if (!r.changes && f.thumb) this.db.run('UPDATE videos SET thumb=? WHERE channel_id=? AND path=? AND thumb IS NULL', f.thumb, channelId, f.path);
@@ -211,15 +237,27 @@ class UploadPilotApp {
     });
     if (added) this.events.info(`${ch.name || 'Channel'}: ${added} new video(s) found`, { channelId, kind: 'scan' });
     this.plan(channelId);
-    if (added) { this.aiKick(); if (this.scheduler) this.scheduler.wake(); }
+    if (added) { this.aiKick(); if (this.scheduler) this.scheduler.wake(); if (this.cloud.backup) this.cloud.backup.kick(); }
     return { added, total: files.length };
   }
 
   addVideoFile(channelId, file) {
     const ch = this.db.get('SELECT * FROM channels WHERE id=?', channelId);
     let size = 0; try { size = fs.statSync(file).size; } catch (_) { return; }
+    if (this._adoptRemote(channelId, file, path.basename(file), size)) return;
     const r = this.db.run('INSERT OR IGNORE INTO videos(channel_id,path,thumb,filename,size,status,created_at) VALUES(?,?,?,?,?,?,?)', channelId, file, findThumb(file), path.basename(file), size, 'queued', Date.now());
-    if (r.changes) { this.events.info(`${ch?.name || 'Channel'}: new video ${path.basename(file)} added`, { channelId, kind: 'scan' }); this.plan(channelId); this.aiKick(); if (this.scheduler) this.scheduler.wake(); }
+    if (r.changes) { this.events.info(`${ch?.name || 'Channel'}: new video ${path.basename(file)} added`, { channelId, kind: 'scan' }); this.plan(channelId); this.aiKick(); if (this.scheduler) this.scheduler.wake(); if (this.cloud.backup) this.cloud.backup.kick(); }
+  }
+
+  /**
+   * v0.3.2: a file in a folder linked on this PC that is another PC's video of the same channel (same
+   * name + size): no duplicate row; the cloud copy remembers where it is here and uploads from it.
+   */
+  _adoptRemote(channelId, file, filename, size) {
+    const r = this.db.get(`SELECT id, status, local_path FROM videos WHERE channel_id=? AND remote=1 AND filename=? AND (size=? OR size IS NULL OR size=0) ORDER BY id DESC LIMIT 1`, channelId, filename, size);
+    if (!r) return false;
+    if (r.local_path !== file && !['done', 'skipped'].includes(r.status)) this.db.applying(() => this.db.run('UPDATE videos SET local_path=? WHERE id=?', file, r.id));
+    return true;
   }
 
   watch(channelId) {
@@ -437,7 +475,8 @@ class UploadPilotApp {
     const s = this.settings.all();
     const msg = String((err && err.message) || err || 'Upload failed').replace(/\u001b\[[0-9;]*m/g, '').split('\n')[0].slice(0, 300);
     const name = (channel && channel.name) || 'Channel';
-    if (err && (err.code === 'ENOENT' || /ENOENT|no such file|File not found/i.test(msg))) {
+    // another PC's video: its file is not "missing" (it is on that PC) — retried like any failure, the file is fetched again
+    if (!v.remote && err && (err.code === 'ENOENT' || /ENOENT|no such file|File not found/i.test(msg))) {
       this.db.run(`UPDATE videos SET status='missing', error=?, error_kind='missing', retry_at=NULL WHERE id=?`, 'File not found', v.id);
       this.events.error(`${name}: ${v.filename} is missing from the folder — not retried`, { channelId: v.channel_id, kind: 'failed' });
       return { action: 'missing' };
@@ -446,14 +485,14 @@ class UploadPilotApp {
     const n = (v.retry_count || 0) + 1;
     const kind = err && err.code ? String(err.code).toLowerCase() : 'error';
     if (n > (r.max ?? 3)) {
-      this.db.run(`UPDATE videos SET status='failed', error=?, error_kind=?, retry_at=NULL WHERE id=?`, msg, kind, v.id);
+      this.db.run(`UPDATE videos SET status='failed', error=?, error_kind=?, retry_at=NULL, failed_version=? WHERE id=?`, msg, kind, VERSION, v.id);
       this.events.error(`${name}: upload of "${v.title || v.filename}" failed ${r.max} retries — ${humanizeError(msg)} (press Retry)`, { channelId: v.channel_id, kind: 'failed', detail: err && err.stack });
       return { action: 'failed' };
     }
     const base = (r.backoffMin[Math.min(n - 1, r.backoffMin.length - 1)] || 5) * 60000;
     const jitter = base * ((r.jitterPct ?? 20) / 100) * (Math.random() * 2 - 1);
     const at = nextInWindow(Date.now() + base + jitter, s.uploadWindow);
-    this.db.run(`UPDATE videos SET status='ready', error=?, error_kind=?, retry_at=?, retry_count=? WHERE id=?`, msg, kind, at, n, v.id);
+    this.db.run(`UPDATE videos SET status='ready', error=?, error_kind=?, retry_at=?, retry_count=?, failed_version=? WHERE id=?`, msg, kind, at, n, VERSION, v.id);
     const hm = new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     this.events.warn(`${name}: upload failed — ${humanizeError(msg)}. Retrying at ${hm} (attempt ${n}/${r.max})`, { channelId: v.channel_id, kind: 'failed', detail: err && err.stack });
     return { action: 'retry', retryAt: at, attempt: n };
@@ -491,7 +530,7 @@ class UploadPilotApp {
    * Is this profile's Google account signed in? Opens youtube.com in a throw-away tab (or the given
    * page), checks the Google auth cookies and where the page ended up. Logs the answer.
    */
-  async checkSignedIn(prof, sess, { log = true, stayMs = 0, page: usePage = null } = {}) {
+  async checkSignedIn(prof, sess, { log = true, stayMs = 0, page: usePage = null, via = 'check', exportLogin = false } = {}) {
     const ctx = sess.handle.context;
     const urls = this.settings.get('urls');
     const page = usePage || await ctx.newPage();
@@ -504,12 +543,158 @@ class UploadPilotApp {
     try { cookies = await ctx.cookies(); } catch (_) { /* ignore */ }
     const ok = googleAuthCookies(cookies).length > 0 && !land.signIn;
     if (!usePage) await page.close().catch(() => {});
-    this.db.run('UPDATE profiles SET login_state=?, login_note=? WHERE id=?', ok ? 'ok' : 'signed_out', ok ? null : 'Sign in needed', prof.id);
+    // signed in: clears a "sign in needed" flag on the profile and its channel(s), saves + re-plans
+    const cleared = ok ? await this.onSignedIn(prof.id, { sess, via, exportLogin }).catch(() => false) : false;
+    if (!ok) this.db.run('UPDATE profiles SET login_state=?, login_note=? WHERE id=?', 'signed_out', 'Sign in needed', prof.id);
     if (log) {
-      if (ok) this.events.success(`Profile #${prof.number}: signed in to YouTube`, { kind: 'profile' });
+      if (ok && !cleared) this.events.success(`Profile #${prof.number}: signed in to YouTube`, { kind: 'profile' });
+      else if (ok) { /* "<channel>: signed in ✓" was logged */ }
       else this.events.warn(`Profile #${prof.number}: not signed in to YouTube — sign in needed`, { kind: 'needs_you', detail: land.error || land.url });
     }
     return { signedIn: ok, url: land.url };
+  }
+
+  // ---------------- v0.3.2: sign-in detection ----------------
+  /** Is this profile (or a channel on it) waiting for a Google sign-in? */
+  loginFlagged(profileId) {
+    const p = this.db.get('SELECT login_state FROM profiles WHERE id=?', profileId);
+    if (!p) return false;
+    if (['signed_out', 'restore_failed'].includes(p.login_state)) return true;
+    return this.db.all(`SELECT status_reason FROM channels WHERE profile_id=? AND status='needs_you'`, profileId).some(c => isLoginReason(c.status_reason));
+  }
+
+  /** Watch an open window (manual or autopilot) for a Google / YouTube sign-in. */
+  _watchSignIn(prof, sess) {
+    if (!sess || !['manual', 'auto'].includes(sess.purpose) || !sess.handle || !sess.handle.context) return;
+    const w = new SignInWatch({
+      context: sess.handle.context, everyMs: this.o.signInWatchMs ?? 10000,
+      flagged: () => this.loginFlagged(prof.id),
+      onSignedIn: reason => this.onSignedIn(prof.id, { sess, via: reason, exportLogin: !(sess.handle.isClosed && sess.handle.isClosed()) }),
+    });
+    w.studioLoaded = !!(sess.landing && !sess.landing.signIn && /^https:\/\/studio\.youtube\.com\//i.test(sess.landing.url || ''));
+    sess.watch = w.start();
+    if (this.loginFlagged(prof.id)) w.check('opened').catch(() => {});
+  }
+
+  /**
+   * A Google sign-in was seen (window, close, check, import). When the profile or its channel was
+   * waiting for one: clear the flag and the Needs-you item at once, save the login to the cloud (a new
+   * version; only the active PC may), log "<channel>: signed in ✓", and re-plan so its jobs run.
+   * Returns true when something was waiting for this sign-in.
+   */
+  async onSignedIn(profileId, { sess = null, via = 'window', exportLogin = true } = {}) {
+    const prof = this.profiles.getProfile(profileId);
+    if (!prof) return false;
+    const was = this.loginFlagged(profileId);
+    this.db.run(`UPDATE profiles SET login_state='ok', login_note=NULL WHERE id=?`, profileId);
+    if (!was) return false;
+    const chans = this.db.all('SELECT * FROM channels WHERE profile_id=?', profileId);
+    for (const ch of chans) if (ch.status === 'needs_you' && isLoginReason(ch.status_reason)) this.db.run(`UPDATE channels SET status='active', status_reason=NULL, paused_until=NULL WHERE id=?`, ch.id);
+    const label = chans.map(c => c.name).filter(Boolean).join(', ') || `Profile #${prof.number}`;
+    this.events.success(`${label}: signed in ✓`, { channelId: chans[0] ? chans[0].id : null, kind: 'channel', detail: `seen: ${via}` });
+    if (exportLogin && sess && this.cloud) await this.cloud.exportLogin(prof, sess, { reason: 'signed in', force: true }).catch(() => null);
+    for (const ch of chans) { try { if (ch.folder) this.plan(ch.id); } catch (_) { /* ignore */ } }
+    if (this.scheduler) this.scheduler.wake();
+    this.aiKick();
+    this.cloud.emit('change');
+    return true;
+  }
+
+  /** Needs you → "Check sign-in": a quick check (the open window's cookies, or a headless visit). */
+  async checkSignIn(channelId) {
+    const ch = this.db.get('SELECT * FROM channels WHERE id=?', channelId);
+    if (!ch) return null;
+    if (!ch.profile_id) throw Object.assign(new Error('Channel has no profile'), { status: 409 });
+    if (this.runner.live.has(ch.id)) throw Object.assign(new Error('Autopilot is uploading on this profile right now'), { status: 409 });
+    const prof = this.profiles.getProfile(ch.profile_id);
+    const open = this.profiles.session(prof.id);
+    if (open && open.watch) {
+      const v = await open.watch.check('Check sign-in');
+      if (v && v.signedIn) { await this.onSignedIn(prof.id, { sess: open, via: 'Check sign-in' }); return { signedIn: true, how: 'open window' }; }
+      if (v) return { signedIn: false, how: 'open window' };
+    }
+    if (open) throw Object.assign(new Error('The profile window is open — sign in there; it is detected by itself'), { status: 409 });
+    const sess = await this.profiles.open(prof.id, { purpose: 'check', headless: true });
+    let r = { signedIn: false };
+    try { r = await this.checkSignedIn(prof, sess, { log: true, via: 'Check sign-in', exportLogin: true }); }
+    finally { sess.noExport = true; await this.profiles.close(prof.id).catch(() => {}); }
+    return { signedIn: !!r.signedIn, how: 'headless check' };
+  }
+
+  /** A newer login in the cloud (with Google cookies) while this profile waits for a sign-in. */
+  loginImportNeeded(p) {
+    return !!p && (p.cloud_state_version || 0) > (p.state_version || 0) && (p.cloud_state_google == null || p.cloud_state_google > 0)
+      && this.loginFlagged(p.id) && !this.profiles.isOpen(p.id);
+  }
+
+  /**
+   * Import the newest cloud login now (headless, before any page loads) and re-check the sign-in.
+   * If it can't run now (browser limit, proxy, …) a cloud copy WITH Google cookies still clears the
+   * stale flag; the next open re-checks it.
+   */
+  async importLoginNow(profileId, { reason = 'newer login in the cloud', verify = true } = {}) {
+    this._importing = this._importing || new Set();
+    if (this._importing.has(profileId)) return null;
+    this._importing.add(profileId);
+    try {
+      const prof = this.profiles.getProfile(profileId);
+      if (!prof) return null;
+      this.events.info(`Profile #${prof.number}: ${reason} — importing it${verify ? ' and checking the sign-in' : ''}`, { kind: 'profile' });
+      try {
+        const sess = await this.profiles.open(profileId, { purpose: 'check', headless: true });   // imported right after launch, before any page loads
+        try { return verify ? await this.checkSignedIn(prof, sess, { log: true, via: 'import' }) : { imported: !!sess.restored }; }
+        finally { sess.noExport = true; await this.profiles.close(profileId).catch(() => {}); }
+      } catch (e) {
+        const p = this.profiles.getProfile(profileId);
+        if (verify && p && p.cloud_state_google > 0 && this.loginFlagged(profileId)) {
+          await this.onSignedIn(profileId, { via: 'cloud login with Google cookies', exportLogin: false });
+          this.db.run(`UPDATE profiles SET login_state='restored', login_note=? WHERE id=?`, 'Newer login from the cloud — checked at the next open', profileId);
+        }
+        return { signedIn: null, error: e.message };
+      }
+    } finally { this._importing.delete(profileId); }
+  }
+
+  /** Every profile that waits for a sign-in while the cloud already has a newer Google login. */
+  async importPendingLogins() {
+    if (!this.cloud.online || !this.cloud.mayRun()) return 0;
+    let n = 0;
+    for (const p of this.db.all(`SELECT * FROM profiles WHERE cloud_state_version > IFNULL(state_version,0)`)) {
+      if (!this.loginImportNeeded(p)) continue;
+      await this.importLoginNow(p.id, { reason: `newer login from ${p.cloud_state_by || 'another PC'}` }).catch(() => {});
+      n++;
+    }
+    return n;
+  }
+
+  // ---------------- v0.3.2: failures left by older versions ----------------
+  /**
+   * After an upgrade: uploads that failed with a code crash in an older version (e.g. "Cannot read
+   * properties of null (reading 'replace')") go back to the queue with their attempts reset, so the
+   * new metadata path handles them; their Needs-you items go with them. Another PC's video that 0.3.1
+   * marked "missing" here waits for its file instead (fileRequests.js).
+   */
+  resetStaleFailures() {
+    const cloudActive = this.cloud.online && this.cloud.mayRun();
+    let n = 0;
+    for (const v of this.db.all(`SELECT v.*, c.name AS channel_name FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.status='failed' AND v.error IS NOT NULL`)) {
+      if (!CODE_CRASH.test(v.error)) continue;
+      if (v.failed_version && !versionLt(v.failed_version, VERSION)) continue;       // failed in this version: a real, new problem
+      if (v.remote && !cloudActive) continue;                                          // another PC's job: the active PC re-queues it
+      const r = this.db.run(`UPDATE videos SET status='queued', error=NULL, error_kind=NULL, retry_at=NULL, retry_count=0, attempts=0, ai_attempts=0, failed_version=NULL,
+        ai_status=CASE WHEN title IS NULL OR TRIM(title)='' OR description IS NULL OR TRIM(description)='' OR tags IS NULL OR tags IN ('','[]') THEN 'pending' ELSE ai_status END WHERE id=? AND status='failed'`, v.id);
+      if (!r.changes) continue;
+      this.aiNextTry.delete(v.id);
+      n++;
+      this.events.info(`${v.channel_name}: "${v.title || v.filename}" had failed in an older version (${humanizeError(v.error).slice(0, 80)}) — queued again`, { channelId: v.channel_id, kind: 'channel' });
+    }
+    if (cloudActive) {
+      const r = this.db.run(`UPDATE videos SET status=CASE WHEN title IS NOT NULL AND TRIM(title)!='' THEN 'ready' ELSE 'queued' END, error=NULL, error_kind=NULL, retry_at=NULL
+        WHERE remote=1 AND status='missing' AND (error IS NULL OR error='File not found')`);
+      n += r.changes;
+    }
+    if (n) { if (this.scheduler) this.scheduler.wake(); this.aiKick(); }
+    return n;
   }
 
   async activateChannel(channelId) {
@@ -591,9 +776,15 @@ class UploadPilotApp {
     if (deleteProfile && ch.profile_id) await this.profiles.deleteProfile(ch.profile_id);
     return true;
   }
+  /** Another PC's video this PC waits for (v0.3.2): {from, state} or null. */
+  _waitingFor(v) {
+    if (!v.remote || v.drive_file_id || !this.cloud.files) return null;
+    if (this.cloud.localCopy(v)) return null;
+    return this.cloud.files.waitingFor(v);
+  }
   listVideos(channelId) {
     return this.db.all('SELECT * FROM videos WHERE channel_id=? ORDER BY CASE WHEN scheduled_at IS NULL THEN 1 ELSE 0 END, scheduled_at, id', channelId)
-      .map(v => ({ ...v, tags: JSON.parse(v.tags || '[]'), hashtags: JSON.parse(v.hashtags || '[]') }));
+      .map(v => ({ ...v, tags: JSON.parse(v.tags || '[]'), hashtags: JSON.parse(v.hashtags || '[]'), waiting_for: v.remote ? this._waitingFor(v) : null }));
   }
   /**
    * Autosave from the channel table: only the fields sent are written, and only when they changed.
@@ -680,12 +871,22 @@ class UploadPilotApp {
     }
     if (!this.settings.get('geminiKeys').length) add('gemini', 'Add a Gemini API key so titles and descriptions are written for you', [{ label: 'Add key', action: 'settings' }]);
     for (const ch of this.db.all(`SELECT c.id, c.name, c.status, c.status_reason, c.profile_id, p.login_state, p.login_note, p.number FROM channels c LEFT JOIN profiles p ON p.id=c.profile_id WHERE c.status IN ('active','paused','needs_you')`)) {
-      if (ch.status === 'needs_you') add(`ch${ch.id}`, `${ch.name || 'Channel'}: ${ch.status_reason || 'needs you'}`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }, { label: 'Resume', action: 'resume', arg: ch.id }]);
-      else if (ch.login_state === 'signed_out') add(`login${ch.id}`, `${ch.name || 'Channel'}: sign in needed`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }]);
-      else if (ch.login_state === 'restore_failed') add(`login${ch.id}`, `${ch.name || 'Channel'}: ${ch.login_note || 'login not restored'}`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }]);
+      const check = { label: 'Check sign-in', action: 'check-signin', arg: ch.id };
+      if (ch.status === 'needs_you') add(`ch${ch.id}`, `${ch.name || 'Channel'}: ${ch.status_reason || 'needs you'}`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }, ...(isLoginReason(ch.status_reason) ? [check] : []), { label: 'Resume', action: 'resume', arg: ch.id }]);
+      else if (ch.login_state === 'signed_out') add(`login${ch.id}`, `${ch.name || 'Channel'}: sign in needed`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }, check]);
+      else if (ch.login_state === 'restore_failed') add(`login${ch.id}`, `${ch.name || 'Channel'}: ${ch.login_note || 'login not restored'}`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }, check]);
     }
     for (const v of this.db.all(`SELECT v.id, v.title, v.filename, v.error, v.status, v.channel_id, c.name FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.status IN ('failed','missing') ORDER BY v.id DESC LIMIT 20`)) {
       add(`v${v.id}`, `${v.name}: "${v.title || v.filename}" ${v.status === 'missing' ? 'file is missing' : 'failed — ' + humanizeError(v.error || '')}`, [{ label: 'Retry', action: 'retry', arg: v.id }], 'error');
+    }
+    // another PC's video whose PC does not answer (v0.3.2)
+    if (this.cloud.files) {
+      for (const v of this.db.all(`SELECT v.*, c.name AS channel_name FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.remote=1 AND v.drive_file_id IS NULL AND v.status IN ('queued','ready','awaiting_approval') AND c.status='active' LIMIT 200`)) {
+        const w = this._waitingFor(v);
+        if (!w) continue;
+        if (w.state === 'offline') add(`file${v.id}`, `${v.channel_name}: Video is on ${w.from}, which is offline — turn it on or relink folder ("${v.title || v.filename}")`, [{ label: 'Skip', action: 'skip', arg: v.id }]);
+        else if (w.state === 'failed') add(`file${v.id}`, `${v.channel_name}: ${w.from} could not send "${v.title || v.filename}"${w.error ? ` (${w.error})` : ''}`, [{ label: 'Skip', action: 'skip', arg: v.id }]);
+      }
     }
     for (const r of this.db.all(`SELECT channel_id, c.name, COUNT(*) AS n FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.status='awaiting_approval' GROUP BY channel_id`)) {
       add(`ok${r.channel_id}`, `${r.name}: ${r.n} video(s) need your OK`, [{ label: 'Review', action: 'channel', arg: r.channel_id }], 'info');

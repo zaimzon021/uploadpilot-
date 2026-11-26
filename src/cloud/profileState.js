@@ -13,6 +13,10 @@
 //   3. apply()     context.addCookies + localStorage (+ setStorageState for IndexedDB) before any page loads
 // Exports are guarded: a PC never uploads over a NEWER cloud version (stale PC), and never replaces a
 // snapshot that has a Google sign-in with one that has none (fresh/signed-out window).
+// v0.3.2: only the ACTIVE PC writes logins (checked locally and again inside the transaction against
+// meta/activePc; firestore.rules enforce the same). A sign-in that was just seen in a window on the
+// active PC (force) may replace a newer cloud copy: that copy can only have come from a PC that was
+// not supposed to write.
 const { storageStateHash } = require('./crypto');
 
 // Google/YouTube auth cookies that mean "signed in" (any one of them on a Google/YouTube domain)
@@ -90,6 +94,8 @@ class ProfileStateSync {
    * @param {string} o.pcId
    * @param {string} o.pcName
    * @param {(lvl:string,msg:string,detail?:string)=>void} [o.log]
+   * @param {() => boolean} [o.singleActive]   one active PC per account: only it may write logins
+   * @param {() => boolean} [o.isActive]       is this PC the active one right now (local view)?
    */
   constructor(o) { Object.assign(this, o); this.log = o.log || (() => {}); this.exports = 0; this.imports = 0; this.skipped = 0; this.refused = 0; this.prepared = new Map(); }
 
@@ -107,7 +113,7 @@ class ProfileStateSync {
     try {
       const d = await this.store.get(`${this.root()}/profiles/${profile.cloud_id}`);
       if (d && d.stateVersion && d.stateVersion !== profile.cloud_state_version) {
-        this.db.run('UPDATE profiles SET cloud_state_version=?, cloud_state_hash=?, cloud_state_file=?, cloud_state_by=? WHERE id=?', d.stateVersion, d.stateHash || null, d.stateFileId || null, d.stateBy || null, profile.id);
+        this.db.run('UPDATE profiles SET cloud_state_version=?, cloud_state_hash=?, cloud_state_file=?, cloud_state_by=?, cloud_state_google=? WHERE id=?', d.stateVersion, d.stateHash || null, d.stateFileId || null, d.stateBy || null, d.stateGoogle ?? null, profile.id);
       }
     } catch (_) { /* offline: use what sync gave us */ }
     return this.db.get('SELECT * FROM profiles WHERE id=?', profile.id) || profile;
@@ -159,9 +165,21 @@ class ProfileStateSync {
   /** Back-compat (tests / callers of 0.3.0): prepare + apply in one go. */
   async importIfNewer(profile, context) { const p = await this.prepare(profile); if (!p.ready) return { imported: false, reason: p.reason }; return this.apply(profile, context); }
 
-  /** Export + upload when the login changed. Call before the context closes. */
-  async exportIfChanged(profile, context, { reason = 'close' } = {}) {
+  /** May this PC write logins? Local view (cheap); the transaction re-checks meta/activePc. */
+  _notActive() { return this.singleActive && this.singleActive() && this.isActive && !this.isActive(); }
+  _activeRefuse(ap) {
+    if (!this.singleActive || !this.singleActive() || !ap || !ap.pcId) return null;
+    if (ap.pcId !== this.pcId || ap.handedOver) return `${ap.handedOver ? 'this PC handed over' : `${ap.pcName || 'another PC'} is the active PC`} — only the active PC saves logins`;
+    return null;
+  }
+
+  /**
+   * Export + upload when the login changed. Call before the context closes.
+   * force: a sign-in was just confirmed in this window on the active PC -> it may replace a newer cloud copy.
+   */
+  async exportIfChanged(profile, context, { reason = 'close', force = false } = {}) {
     if (!profile.cloud_id) return { exported: false, reason: 'not synced yet' };
+    if (this._notActive()) { this.refused++; this.log('warn', `Profile #${profile.number}: login not saved — this PC is not the active one (only the active PC saves logins)`); return { exported: false, refused: 'not the active PC' }; }
     const state = await exportStorageState(context);
     const h = storageStateHash(state);
     if (h === profile.state_hash) { this.skipped++; return { exported: false, unchanged: true }; }
@@ -171,7 +189,8 @@ class ProfileStateSync {
     const p = `${this.root()}/profiles/${profile.cloud_id}`;
     // guard BEFORE uploading anything: a newer cloud copy, or a signed-in copy vs. a signed-out window
     const cur = await this.store.get(p).catch(() => null);
-    const refuse = this._refuse(profile, cur, info);
+    const ap0 = this.singleActive && this.singleActive() ? await this.store.get(`${this.root()}/meta/activePc`).catch(() => null) : null;
+    const refuse = this._activeRefuse(ap0) || this._refuse(profile, cur, info, { force });
     if (refuse) { this.refused++; this.log('warn', `Profile #${profile.number}: login not saved — ${refuse}`); return { exported: false, refused: refuse }; }
     const nextV = ((cur && cur.stateVersion) || 0) + 1;
     const file = await r.drive.putSmall({ parts: ['profiles'], name: `profile-${profile.cloud_id}-v${nextV}.state`, data: this.keys.encJson(state) });
@@ -179,25 +198,30 @@ class ProfileStateSync {
     try {
       res = await this.store.tx(async t => {
         const c = await t.get(p);
-        const why = this._refuse(profile, c, info);
+        const ap = this.singleActive && this.singleActive() ? await t.get(`${this.root()}/meta/activePc`) : null;
+        const why = this._activeRefuse(ap) || this._refuse(profile, c, info, { force });
         if (why) return { refused: why };
         const v = ((c && c.stateVersion) || 0) + 1;
-        t.set(p, { stateVersion: v, stateHash: h, stateFileId: file.id, stateBy: this.pcName, stateCookies: info.cookies, stateGoogle: info.auth, stateAt: this.store.SERVER_TS, updatedAt: this.store.SERVER_TS, updatedBy: this.pcId }, { merge: true });
+        t.set(p, { stateVersion: v, stateHash: h, stateFileId: file.id, stateBy: this.pcName, stateByPc: this.pcId, stateCookies: info.cookies, stateGoogle: info.auth, stateAt: this.store.SERVER_TS, updatedAt: this.store.SERVER_TS, updatedBy: this.pcId }, { merge: true });
         return { version: v, oldFile: c && c.stateFileId };
       });
-    } catch (e) { await r.drive.remove(file.id).catch(() => {}); throw e; }
+    } catch (e) {
+      await r.drive.remove(file.id).catch(() => {});
+      if (e.code === 'permission-denied') { this.refused++; this.log('warn', `Profile #${profile.number}: login not saved — the cloud refused it (only the active PC saves logins)`); return { exported: false, refused: 'permission-denied' }; }
+      throw e;
+    }
     if (res.refused) { await r.drive.remove(file.id).catch(() => {}); this.refused++; this.log('warn', `Profile #${profile.number}: login not saved — ${res.refused}`); return { exported: false, refused: res.refused }; }
     if (res.oldFile && res.oldFile !== file.id) r.drive.remove(res.oldFile).catch(() => {});
-    this.db.run('UPDATE profiles SET state_version=?, state_hash=?, cloud_state_version=?, cloud_state_hash=?, cloud_state_file=?, login_state=?, login_note=NULL WHERE id=?', res.version, h, res.version, h, file.id, info.auth ? 'ok' : 'signed_out', profile.id);
+    this.db.run('UPDATE profiles SET state_version=?, state_hash=?, cloud_state_version=?, cloud_state_hash=?, cloud_state_file=?, cloud_state_google=?, login_state=?, login_note=NULL WHERE id=?', res.version, h, res.version, h, file.id, info.auth, info.auth ? 'ok' : 'signed_out', profile.id);
     this.exports++;
     this.log('info', `Profile #${profile.number}: login saved to the cloud (v${res.version}, ${info.cookies} cookies${reason !== 'close' ? ', ' + reason : ''})`);
     return { exported: true, version: res.version, fileId: file.id, cookies: info.cookies, auth: info.auth };
   }
 
-  _refuse(profile, cur, info) {
+  _refuse(profile, cur, info, { force = false } = {}) {
     if (!cur) return null;
     const mine = profile.state_version || 0;
-    if ((cur.stateVersion || 0) > mine) return `the cloud has a newer login (v${cur.stateVersion}, this PC has v${mine})`;
+    if ((cur.stateVersion || 0) > mine && !(force && info.auth)) return `the cloud has a newer login (v${cur.stateVersion}, this PC has v${mine})`;
     if (!info.auth && (cur.stateGoogle > 0 || (cur.stateGoogle === undefined && cur.stateVersion > 0))) return 'this window has no Google sign-in; the signed-in copy in the cloud is kept';
     return null;
   }

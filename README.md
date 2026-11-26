@@ -1,4 +1,4 @@
-# UploadPilot v0.3.1 (sign in once, one active PC, autosave + retries)
+# UploadPilot v0.3.2 (sign-in detection, active-PC-only logins, files from other PCs)
 
 Windows desktop app (Electron) that uploads videos to many YouTube channels on its own, through **YouTube Studio**. Each channel runs in its own real, isolated Chromium profile (its own data folder, cookies and storage), behind its own SOCKS5 proxy. There is **no fingerprint spoofing**.
 
@@ -12,6 +12,12 @@ You link a channel once (sign in by hand, pick a style, pick a folder). After th
 * **One active PC, with take-over.** Only one PC per account runs autopilot (it holds `meta/activePc`, renewed every ~30 s by server time). Signing in on another PC shows **"UploadPilot is active on PC-x — Take over?"**. The old PC finishes or stops its current upload, saves its logins, backs up, releases its leases and signs out; the new PC then becomes active. If the old PC is dead or offline (no heartbeat for ~2 min), the take-over happens without it. The dashboard shows **Active on: PC-x**.
 * **Google sign-in fix (DBSC).** Chromium on Windows now binds a Google login to the PC's TPM ("Device Bound Session Credentials"), so a login copied to another PC signed out within minutes. These features are now switched off for every profile. **After updating, every existing profile needs one fresh Google sign-in** (Open profile → sign in to Google → Resume). After that the login moves between PCs normally. A daily keep-alive visit to youtube.com keeps unused profiles' cookies fresh.
 * **Autosave and automatic retries.** Settings and channel fields save themselves as you type (no Save buttons; "Saved ✓" appears next to the field). Gemini writes the title, description and tags as soon as a video is found; a video is never uploaded without them (after 5 min without AI it gets a clean title from its file name). A failed upload is retried automatically up to 3 times (after ~5, 15, 45 min, inside the upload window only); **Needs you** lists what only you can fix, with a button for each.
+
+**New in 0.3.2:**
+* **Sign-in is noticed.** When a profile window is open (by you or by autopilot) and its channel says "Sign in needed", UploadPilot watches the window: every page load (Studio loading without a bounce to accounts.google.com) plus a cookie check every ~10 s (`SID`/`__Secure-1PSID` on .google.com and a signed-in .youtube.com), and once more when a tab or the window closes. As soon as you are signed in, the flag and its **Needs you** item disappear, the login is saved to the cloud as a new version, the feed says **"<channel>: signed in ✓"**, and the channel's videos are planned again. **Needs you → Check sign-in** runs a quick headless check of a closed profile. A newer login in the cloud with Google cookies is imported (and re-checked) on the active PC as soon as it arrives, so a stale "Sign in needed" never sticks.
+* **Only the active PC saves logins.** A PC that is not (or no longer) the active one never exports a profile login: checked on the PC, again inside the save transaction against `meta/activePc`, and by the Firestore rules (**re-publish `firestore.rules`**).
+* **Old failures are retried after the update.** Uploads that failed in an older version because of an app bug (e.g. "Cannot read properties of null (reading 'replace')") go back to the queue with their attempts reset; their Needs-you items go away.
+* **Videos whose file is on another PC.** The active PC uses, in order: the same file at the same folder path on this PC (same name and size) or in a folder linked here; the Drive backup, downloaded when it is due (any hour); otherwise it asks the PC that has the file to upload just that file to Drive now (ignores idle hours, keeps the speed cap). The row shows **"Waiting for file from PC-x"**. If that PC doesn't answer, **Needs you** says *"Video is on PC-x, which is offline — turn it on or relink folder"* (with **Skip**); the request is served when that PC is back. New per-channel option **"Back up new videos to Google Drive right away"** (on by default, speed-capped, paused during YouTube uploads); **"only during idle hours"** is in Advanced.
 
 ---
 
@@ -69,7 +75,9 @@ src/cloud/leases.js     job / profile leases (transaction claim, 30 s renew, ~2 
 src/cloud/profileState.js  login sync: storageState({indexedDB:true}) -> AES-256-GCM -> Drive; import before navigation
 src/cloud/drive.js      Drive v3: folders, chunked resumable upload with speed cap, pause/abort/resume, download, back-off
 src/cloud/googleAuth.js OAuth Desktop loopback + PKCE (scope drive.file), refresh token in safeStorage
-src/cloud/backup.js     optional video backup (idle hours only, never during a YouTube upload, speed cap)
+src/cloud/backup.js     video backup (new videos right away per channel, everything else in idle hours; never during a YouTube upload; speed cap)
+src/cloud/fileRequests.js  0.3.2: the active PC asks the PC that has a file for a priority Drive upload (meta/file_<video>)
+src/profiles/signInWatch.js  0.3.2: notices a Google/YouTube sign-in in an open profile window
 src/cloud/store/        Firestore adapter (modular SDK) + in-memory stand-in used by tests
 src/ai/lowres.js        360p low-bitrate copy for Gemini (ffmpeg-static, idle priority, one at a time)
 src/util/logRotate.js   log / run-folder / events-table / cache rotation
@@ -112,7 +120,7 @@ Failure handling:
 * **Files stay where they are.** A channel's folder belongs to one PC. Other PCs see its videos as cloud copies (`cloud:<id>`). Planning and Gemini run only on the PC that has the file, and so does the YouTube upload. Another PC **takes over** a job only when (a) the owner's job lease expired mid-upload (the PC died) or (b) the video is overdue by `takeoverGraceMin` (default 120 min), **and** a Drive backup exists. It downloads the backup into `<data>/cache`, uploads it, and deletes the cache file afterwards. The owner then moves its file to `Done/`.
 * **Leases** (`users/{uid}/leases/{video_<id>|profile_<id>}` = `{pcId, pcName, renewedAt: serverTimestamp, ttlSec: 120, expiresAt, released}`): claimed in a transaction before an upload and before any profile opens; renewed every 30 s; released when done. Others skip a held job/profile ("running on PC-x"). After ~2 min without renewal another PC may take over. Expiry is checked against **server time** by the rules (`request.time > renewedAt + ttl`), so a PC with a wrong clock can't steal a live lease. If a PC that lost its lease comes back, its next renewal is refused and its upload stops.
 * **Profile logins** move as Playwright `storageState({indexedDB:true})`: cookies + localStorage + IndexedDB, **not** a raw folder copy (Windows DPAPI makes copied cookies useless). On close (and every 3 min for hand-used windows) the state is hashed. Only if it changed is it encrypted (AES-256-GCM with the account data key) and uploaded to Drive `UploadPilot/profiles/profile-<id>.state`, with `stateVersion`++. A PC with an older or missing version downloads and imports it (`context.setStorageState`) **before the first navigation**.
-* **Drive backup** (optional, off by default): `UploadPilot/channels/<channel>/<file>`. Resumable 8 MB chunks, speed cap (user KB/s, else 30% of the speed measured on the first chunk), only inside the idle-hours window (default 01:00–07:00, may wrap midnight), and never while this PC uploads to YouTube: the chunk in flight is aborted and resumed later from the server offset. Back-off on 403 `userRateLimitExceeded`/429/5xx; daily-limit errors pause it for the day; a local counter stops at 700 GB/day (Drive's limit is ~750 GB). By default the backup is deleted once the video is published (`backup.deleteAfterUpload`).
+* **Drive backup**: `UploadPilot/channels/<channel>/<file>`. 0.3.2: each channel backs up its new videos right away by default (`style.backupNew`; Advanced → only during idle hours); a file the active PC is waiting for is uploaded at once on request (`meta/file_<video>`). The all-videos switch below works as before. Resumable 8 MB chunks, speed cap (user KB/s, else 30% of the speed measured on the first chunk), only inside the idle-hours window (default 01:00–07:00, may wrap midnight), and never while this PC uploads to YouTube: the chunk in flight is aborted and resumed later from the server offset. Back-off on 403 `userRateLimitExceeded`/429/5xx; daily-limit errors pause it for the day; a local counter stops at 700 GB/day (Drive's limit is ~750 GB). By default the backup is deleted once the video is published (`backup.deleteAfterUpload`).
 * **Quota (Spark: 50k reads / 20k writes a day):** no heartbeats except lease renewals (2 writes/min per running upload). Video progress rides on the lease renewal. Diffed and batched writes. Activity is batched every 15 s, important kinds only, max 1500/day. Videos are listened to with two narrow queries (unfinished + changed in the last 36 h). Above `writeBudget` (18k) activity/plan docs pause. Settings → Cloud shows today's reads and writes. A rough guide: 100 channels × 2 uploads/day ≈ 3–5k writes/day. Each app start re-reads the active docs (no persistent Firestore cache in Node).
 * **Offline:** if Firestore can't be reached, this PC still uploads **its own** files without a lease (logged) and syncs later. It never takes over another PC's file without the cloud.
 
@@ -138,7 +146,7 @@ npm run test:emulator       # Firestore + Auth emulators with the real rules (ne
 ```
 The Windows installer ships its own Chromium (Playwright's build matching playwright-core), so no Chrome install is needed. For a dev checkout run `npm run browsers:install` once.
 
-Building: `npm run build` builds `dist/UploadPilot Setup 0.3.1.exe` (NSIS, x64, per-user, lets you pick the install folder, desktop shortcut). Run it on Windows (or x64 Linux). `npm run build:win-dir` makes `dist/win-unpacked/UploadPilot.exe` without NSIS.
+Building: `npm run build` builds `dist/UploadPilot Setup 0.3.2.exe` (NSIS, x64, per-user, lets you pick the install folder, desktop shortcut). Run it on Windows (or x64 Linux). `npm run build:win-dir` makes `dist/win-unpacked/UploadPilot.exe` without NSIS.
 
 ---
 
@@ -174,7 +182,8 @@ Security: the Host header must be loopback (blocks DNS rebinding). A request car
 | PATCH | `/channels/:id` | `{name?, folder?, style?:{niche,language,madeForKids,footer,hashtags,mode,visibility,perDay}}` | channel |
 | DELETE | `/channels/:id` | `?deleteProfile=1` | `{deleted}` |
 | POST | `/channels/:id/scan` | | `{added, total}` |
-| POST | `/channels/:id/open-profile` | | opens the profile at Studio for manual use |
+| POST | `/channels/:id/open-profile` | | opens the profile at Studio for manual use (the window is watched for a Google sign-in) |
+| POST | `/channels/:id/check-signin` | | quick sign-in check (open window's cookies, or a headless visit): `{signedIn, how}` |
 | GET | `/channels/:id/videos` | | plan list |
 | GET | `/channels/:id/runs` | | last 50 runs with log folder |
 | PATCH | `/videos/:id` | `{title?, description?, tags?, hashtags?, scheduled_at?}` | video |
@@ -207,7 +216,7 @@ Example: `curl -s -XPOST localhost:53300/api/v1/profiles/3/open` returns `data.w
 ## Settings (defaults)
 videosPerDay 2 · uploadWindow 09:00–23:00 · lanes 3 · delayRangeMin 1–7 · geminiModel `gemini-3.5-flash-lite` (use "Test keys / list models" to confirm the exact name your key offers) · upload.stepTimeoutMs 60 000 · upload.channelHardLimitMs 1 200 000 · upload.maxRetries 3 · retry {max 3, backoff 5/15/45 min, ±20%} · aiWriteAhead true · keepAlive {on, profiles unused 24 h, 20 s visit} · typing per char 35–160 ms for the first 350 chars, then quick chunks · browser.windowMode minimized · apiPort 53300.
 
-Cloud: `cloud.backup` {enabled false, speedCapKBps 0 (=30% of measured), idleHours 01:00–07:00, chunkMB 8, deleteAfterUpload true} · takeoverGraceMin 120 · singleActivePc true · leaseTtlSec 120 / leaseRenewSec 30 · writeBudget 18000 · pauseWhenActive {false, 5 min} · geminiLowRes {true, 360p, 300 kbps} · browser.blockMedia false · logRetentionDays 14.
+Cloud: `cloud.backup` {enabled false, idleHoursOnly false, speedCapKBps 0 (=30% of measured), idleHours 01:00–07:00, chunkMB 8, deleteAfterUpload true} · channel `style.backupNew` true · takeoverGraceMin 120 · singleActivePc true · leaseTtlSec 120 / leaseRenewSec 30 · writeBudget 18000 · pauseWhenActive {false, 5 min} · geminiLowRes {true, 360p, 300 kbps} · browser.blockMedia false · logRetentionDays 14.
 
 ## Known gaps / risks
 See TESTING.md → "Needs live verification".
