@@ -77,5 +77,5 @@ All 42 routes + the SSE stream hit for real (43 counted): settings (keys masked,
 5. **Duplicate drafts**: if the dialog is lost after the file was chosen, the retry uploads again, which can leave an extra draft in Studio.
 6. **Gemini model name**: the default `gemini-3.5-flash-lite` came from the brief and wasn't checked. Use Settings → "Test keys / list models". Large videos stream to the Files API but count against Gemini quotas.
 7. **Real proxies**: only tested against local SOCKS5 servers. `proxyCheckUrl` is ipify over HTTPS through the tunnel.
-8. **Windows packaging**: run `npm run build` on a Windows machine. Chrome must be installed (playwright-core ships no browser).
+8. **Windows packaging**: run `npm run build` on a Windows machine. CI runs `node scripts/install-browser.js` first so the installer bundles Chromium in `resources/browsers`.
 9. **Upload window across midnight** (e.g. 20:00–02:00) isn't supported; the end time must come after the start time.

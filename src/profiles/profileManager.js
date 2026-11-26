@@ -36,6 +36,31 @@ class ProfileManager {
     const r = this.addProxies(text);
     return { ...r, errors };
   }
+  /**
+   * Sync the pool to the Settings textarea text. Lines whose password is masked (••••) keep the saved
+   * proxy as-is; other lines are added, or update the saved password when host:port:user already exists.
+   * Saved proxies missing from the text are removed unless a profile uses them.
+   */
+  syncProxyPool(text) {
+    const MASK = '••••';
+    const lines = String(text || '').split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+    const keptHostPort = new Set(lines.filter(l => l.includes(MASK)).map(l => l.split(':').slice(0, 2).join(':').toLowerCase()));
+    const { proxies, errors } = parseProxyList(lines.filter(l => !l.includes(MASK)).join('\n'));
+    const freshKeys = new Set(proxies.map(p => `${p.host}:${p.port}:${p.username || ''}`.toLowerCase()));
+    let removed = 0, added = 0, updated = 0;
+    for (const row of this.db.all('SELECT p.*, (SELECT COUNT(*) FROM profiles f WHERE f.proxy_id=p.id) AS used FROM proxies p')) {
+      const hp = `${row.host}:${row.port}`.toLowerCase();
+      if (keptHostPort.has(hp) || freshKeys.has(`${hp}:${row.username || ''}`.toLowerCase()) || row.used) continue;
+      removed += this.db.run('DELETE FROM proxies WHERE id=?', row.id).changes;
+    }
+    for (const p of proxies) {
+      const ins = this.db.run('INSERT OR IGNORE INTO proxies(host,port,username,password) VALUES(?,?,?,?)', p.host, p.port, p.username || '', p.password || '');
+      if (ins.changes) { added++; continue; }
+      const u = this.db.run("UPDATE proxies SET password=?, status='unknown' WHERE host=? AND port=? AND username=? AND password IS NOT ?", p.password || '', p.host, p.port, p.username || '', p.password || '');
+      updated += u.changes;
+    }
+    return { added, updated, removed, parsed: proxies.length, errors, total: this.db.get('SELECT COUNT(*) AS n FROM proxies').n };
+  }
   listProxies() {
     return this.db.all(`SELECT p.id, p.host, p.port, p.username, p.label, p.status, p.last_ip, p.last_check, p.last_error,
       (SELECT GROUP_CONCAT(number) FROM profiles f WHERE f.proxy_id=p.id) AS profiles FROM proxies p ORDER BY p.id`);

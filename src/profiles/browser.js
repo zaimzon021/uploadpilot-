@@ -11,27 +11,58 @@ function freePort() {
   return new Promise((res, rej) => { const s = net.createServer(); s.unref(); s.on('error', rej); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); });
 }
 
-function detectExecutable(cfg = {}) {
-  if (cfg.executablePath && fs.existsSync(cfg.executablePath)) return cfg.executablePath;
-  if (process.env.UPLOADPILOT_CHROME && fs.existsSync(process.env.UPLOADPILOT_CHROME)) return process.env.UPLOADPILOT_CHROME;
+const exists = p => { try { return !!p && fs.existsSync(p); } catch (_) { return false; } };
+
+/** Browser binaries inside a Playwright-style browsers folder (chromium-<rev>/chrome-<plat>/...), newest revision first. */
+function chromiumInBrowsersDir(root, platform = process.platform) {
+  const subs = platform === 'win32' ? ['chrome-win64/chrome.exe', 'chrome-win/chrome.exe']
+    : platform === 'darwin' ? ['chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium', 'chrome-mac/Chromium.app/Contents/MacOS/Chromium']
+    : ['chrome-linux64/chrome', 'chrome-linux/chrome', 'chrome-linux-arm64/chrome'];
+  let dirs = [];
+  try { dirs = fs.readdirSync(root).filter(d => /^chromium-\d+$/.test(d)).sort((x, y) => +y.split('-')[1] - +x.split('-')[1]); } catch (_) { return []; }
+  const out = [];
+  for (const d of dirs) {
+    for (const sub of subs) out.push(path.join(root, d, sub));
+    // any other chrome-win* layout Playwright may use in future
+    if (platform === 'win32') {
+      try { for (const x of fs.readdirSync(path.join(root, d))) if (/^chrome-win/.test(x)) out.push(path.join(root, d, x, 'chrome.exe')); } catch (_) { /* skip */ }
+    }
+  }
+  return out;
+}
+
+/** Folders that may hold the Chromium shipped with the app (installer: resources/browsers; dev: <repo>/browsers). */
+function bundledBrowserRoots(opts = {}) {
+  const roots = [];
+  const resourcesPath = opts.resourcesPath !== undefined ? opts.resourcesPath : process.resourcesPath;
+  if (resourcesPath) roots.push(path.join(resourcesPath, 'browsers'));
+  roots.push(path.join(__dirname, '..', '..', 'browsers'));
+  return roots;
+}
+
+/**
+ * Pick the browser binary. Order: user-set executablePath (if it exists) -> UPLOADPILOT_CHROME env ->
+ * built-in Chromium shipped with the app -> installed Google Chrome -> Playwright's default download -> system Chromium.
+ */
+function detectExecutable(cfg = {}, opts = {}) {
+  const platform = opts.platform || process.platform;
+  if (exists(cfg.executablePath)) return cfg.executablePath;
+  if (exists(process.env.UPLOADPILOT_CHROME)) return process.env.UPLOADPILOT_CHROME;
   const candidates = [];
-  if (process.platform === 'win32') {
+  for (const root of bundledBrowserRoots(opts)) candidates.push(...chromiumInBrowsersDir(root, platform));
+  if (platform === 'win32') {
     const pf = [process.env['PROGRAMFILES'], process.env['PROGRAMFILES(X86)'], process.env['LOCALAPPDATA']].filter(Boolean);
     for (const base of pf) candidates.push(path.join(base, 'Google', 'Chrome', 'Application', 'chrome.exe'));
-    // bundled chromium next to the app (resources/chromium/chrome.exe) if shipped
-    if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'chromium', 'chrome.exe'));
-  } else if (process.platform === 'darwin') {
+  } else if (platform === 'darwin') {
     candidates.push('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
+  } else {
+    candidates.push('/usr/bin/google-chrome', '/usr/bin/google-chrome-stable');
   }
   // Playwright-managed Chromium (npx playwright install chromium)
-  const pwRoot = process.env.PLAYWRIGHT_BROWSERS_PATH || (process.platform === 'win32' ? path.join(os.homedir(), 'AppData', 'Local', 'ms-playwright') : path.join(os.homedir(), '.cache', 'ms-playwright'));
-  try {
-    for (const d of fs.readdirSync(pwRoot).filter(d => /^chromium-\d+$/.test(d)).sort().reverse()) {
-      for (const sub of ['chrome-win/chrome.exe', 'chrome-win64/chrome.exe', 'chrome-linux/chrome', 'chrome-linux64/chrome', 'chrome-linux-arm64/chrome', 'chrome-mac/Chromium.app/Contents/MacOS/Chromium']) candidates.push(path.join(pwRoot, d, sub));
-    }
-  } catch (_) { /* none */ }
-  if (process.platform === 'linux') candidates.push('/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser');
-  return candidates.find(c => { try { return fs.existsSync(c); } catch (_) { return false; } }) || null;
+  const pwRoot = process.env.PLAYWRIGHT_BROWSERS_PATH || (platform === 'win32' ? path.join(os.homedir(), 'AppData', 'Local', 'ms-playwright') : platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright') : path.join(os.homedir(), '.cache', 'ms-playwright'));
+  candidates.push(...chromiumInBrowsersDir(pwRoot, platform));
+  if (platform === 'linux') candidates.push('/usr/bin/chromium', '/usr/bin/chromium-browser');
+  return candidates.find(exists) || null;
 }
 
 function buildArgs({ proxyUrl, windowMode, debugPort, extraArgs = [] }) {
@@ -83,7 +114,7 @@ async function minimizeWindows(context, browser) {
 async function launchProfileBrowser({ userDataDir, proxyUrl, cfg, windowMode, headless, proxyBypassLoopback = false }) {
   const { chromium } = require('playwright-core');
   const executablePath = cfg.channel ? undefined : detectExecutable(cfg);
-  if (!executablePath && !cfg.channel) throw new Error('No Chrome/Chromium found. Install Google Chrome or set Settings → browser.executablePath.');
+  if (!executablePath && !cfg.channel) throw new Error('No browser engine found. The built-in Chromium is missing — reinstall UploadPilot, install Google Chrome, or set Settings → Browser engine path.');
   const debugPort = await freePort();
   const extra = [...(cfg.extraArgs || [])];
   if (proxyBypassLoopback) extra.push('--proxy-bypass-list=<-loopback>');
@@ -118,4 +149,4 @@ async function launchProfileBrowser({ userDataDir, proxyUrl, cfg, windowMode, he
   return { context, browser, cdpEndpoint, debugPort, executablePath, close, isClosed: () => closed };
 }
 
-module.exports = { launchProfileBrowser, detectExecutable, buildArgs, freePort, waitForCdp };
+module.exports = { launchProfileBrowser, detectExecutable, chromiumInBrowsersDir, bundledBrowserRoots, buildArgs, freePort, waitForCdp };

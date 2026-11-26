@@ -215,9 +215,10 @@ async function renderSettings() {
       <h2>Proxy pool</h2>
       <div class="field"><label>SOCKS5 proxies, one per line: <code>host:port:user:pass</code></label><textarea id="proxies" style="min-height:180px" placeholder="1.2.3.4:1080:user:pass">${esc(s.proxyPoolText)}</textarea>
       <div class="muted small" style="margin-top:6px">Passwords of saved proxies are hidden (••••). Lines you leave unchanged keep their saved password; proxies used by a profile are never removed.</div></div>
-      <button class="btn ghost" id="checkAll">Check all proxies</button> <span id="checkOut" class="muted"></span>
+      <div id="proxyState" class="muted small" style="margin-bottom:8px"></div>
+      <button class="btn ghost" id="checkAll">Check all proxies</button><div id="checkOut" class="muted" style="margin-top:10px;line-height:1.9"></div>
       <h2 style="margin-top:22px">Gemini</h2>
-      <div class="field"><label>API keys, one per line (${s.geminiKeyCount} saved — leave empty to keep them)</label><textarea id="keys" placeholder="${esc(s.geminiKeys.join('\n'))}"></textarea></div>
+      <div class="field"><label id="keysLabel">API keys, one per line (${s.geminiKeyCount} saved — leave empty to keep them)</label><textarea id="keys" placeholder="${esc(s.geminiKeys.join('\n'))}"></textarea></div>
       <div class="grid2"><div class="field"><label>Model</label><input id="model" value="${esc(s.geminiModel)}"></div><div class="field"><label>&nbsp;</label><button class="btn ghost" id="testG">Test keys / list models</button></div></div>
       <div id="gOut" class="muted small"></div>
     </div>
@@ -234,7 +235,7 @@ async function renderSettings() {
         <div class="field"><label>Per-channel time limit (minutes)</label><input id="hard" type="number" min="5" value="${Math.round(s.upload.channelHardLimitMs / 60000)}"></div>
       </div>
       <h2 style="margin-top:8px">Browser</h2>
-      <div class="field"><label>Chrome / Chromium path (blank = auto-detect)</label><input id="exe" value="${esc(s.browser.executablePath)}" placeholder="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"></div>
+      <div class="field"><label>Browser engine: Built-in Chromium (leave blank)</label><input id="exe" value="${esc(s.browser.executablePath)}" placeholder="Built-in"></div>
       <div class="grid2"><div class="field"><label>Autopilot windows</label><select id="wmode">${[['minimized', 'Minimized (default)'], ['offscreen', 'Off-screen'], ['normal', 'Normal']].map(([v, l]) => `<option value="${v}" ${s.browser.windowMode === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
         <div class="field"><label>Launch mode</label><select id="lmode">${[['persistent', 'Playwright persistent'], ['cdp', 'Spawn + CDP attach']].map(([v, l]) => `<option value="${v}" ${s.browser.launchMode === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
       <div class="field"><label>Local API token (optional; blank = none) · API on 127.0.0.1:${s.apiPort}</label><input id="tok" value="${esc(s.apiToken)}"></div>
@@ -242,8 +243,44 @@ async function renderSettings() {
     </div>
   </div>`;
   const $ = id => document.getElementById(id);
-  const original = s.proxyPoolText;
+  let savedProxyText = s.proxyPoolText;
+  // Save the proxy pool textarea (masked lines keep their saved password). Runs on blur, after typing stops,
+  // on Save settings and before Check all, so pasted proxies never need a separate Save click.
+  let proxySaving = null;
+  const syncProxies = async (opts = {}) => {
+    while (proxySaving) await proxySaving.catch(() => {});   // never run two syncs at once
+    proxySaving = syncProxiesNow(opts).finally(() => { proxySaving = null; });
+    return proxySaving;
+  };
+  const syncProxiesNow = async ({ quiet = false } = {}) => {
+    const text = $('proxies').value;
+    if (text === savedProxyText) return null;
+    const r = await api('POST', '/proxies', { sync: true, text });
+    savedProxyText = text;
+    const parts = [];
+    if (r.added) parts.push(`${r.added} added`);
+    if (r.updated) parts.push(`${r.updated} updated`);
+    if (r.removed) parts.push(`${r.removed} removed`);
+    if (r.errors.length) parts.push(`${r.errors.length} bad line(s): ${r.errors.map(e => e.error || e.message || e).join('; ')}`);
+    $('proxyState').textContent = `Proxies saved — ${r.total} in pool${parts.length ? ' (' + parts.join(', ') + ')' : ''}`;
+    if (!quiet || r.errors.length) toast(`Proxies saved: ${parts.join(', ') || 'no changes'}`, !!r.errors.length);
+    refreshSide();
+    return r;
+  };
+  let proxyTimer = null;
+  $('proxies').addEventListener('input', () => { $('proxyState').textContent = 'Unsaved changes…'; clearTimeout(proxyTimer); proxyTimer = setTimeout(guard(() => syncProxies({ quiet: true })), 1500); });
+  $('proxies').addEventListener('blur', () => { clearTimeout(proxyTimer); guard(() => syncProxies({ quiet: true }))(); });
+  let keysSaving = null;
+  const saveKeys = () => keysSaving || (keysSaving = (async () => {
+    const k = $('keys').value.trim(); if (!k) return;
+    const r = await api('PUT', '/settings', { geminiKeys: k });
+    $('keys').value = ''; $('keys').placeholder = (r.geminiKeys || []).join('\n');
+    $('keysLabel').textContent = `API keys, one per line (${r.geminiKeyCount} saved — leave empty to keep them)`;
+    toast(`Gemini keys saved (${r.geminiKeyCount})`);
+  })().finally(() => { keysSaving = null; }));
+  $('keys').addEventListener('blur', guard(saveKeys));
   $('save').onclick = guard(async () => {
+    clearTimeout(proxyTimer);
     const patch = {
       geminiModel: $('model').value.trim(), videosPerDay: +$('perDay').value, lanes: +$('lanes').value,
       uploadWindow: { start: $('wStart').value, end: $('wEnd').value === '23:59' ? '24:00' : $('wEnd').value },
@@ -253,21 +290,47 @@ async function renderSettings() {
       apiToken: $('tok').value.trim(),
     };
     if ($('keys').value.trim()) patch.geminiKeys = $('keys').value;
-    if ($('proxies').value !== original) {
-      // keep unchanged masked lines as-is: send only lines with real passwords plus host:port of kept ones
-      const lines = $('proxies').value.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-      const fresh = lines.filter(l => !l.includes('••••'));
-      const keptMasked = lines.filter(l => l.includes('••••'));
-      const keptIds = new Set(keptMasked.map(l => l.split(':').slice(0, 2).join(':')));
-      const existing = await api('GET', '/proxies');
-      for (const p of existing) if (!keptIds.has(`${p.host}:${p.port}`) && !p.profiles) await api('DELETE', `/proxies/${p.id}`);
-      if (fresh.length) { const r = await api('POST', '/proxies', { text: fresh.join('\n') }); toast(`Proxies: ${r.added} added${r.errors.length ? `, ${r.errors.length} bad line(s)` : ''}`, !!r.errors.length); }
-    }
+    await syncProxies();
     await api('PUT', '/settings', patch);
     toast('Settings saved'); refreshSide(); render();
   });
-  $('checkAll').onclick = guard(async () => { $('checkOut').innerHTML = '<span class="spinner"></span>checking…'; const r = await api('POST', '/proxies/check-all'); $('checkOut').innerHTML = r.map(x => `<span class="pill ${x.ok ? 'g' : 'r'}" title="${esc(x.error || '')}">${esc(x.label)} ${x.ok ? esc(x.ip) : 'dead'}</span>`).join(' ') || 'no proxies'; });
-  $('testG').onclick = guard(async () => { $('gOut').textContent = 'Testing…'; const r = await api('POST', '/settings/gemini/test'); $('gOut').textContent = `OK — ${r.models.length} models: ${r.models.filter(m => /flash/.test(m)).join(', ')}`; });
+  $('checkAll').onclick = guard(async () => {
+    clearTimeout(proxyTimer);
+    const out = $('checkOut');
+    out.innerHTML = '<span class="spinner"></span>saving & checking…';
+    try {
+      await syncProxies({ quiet: true });
+      const r = await api('POST', '/proxies/check-all');
+      if (!r.length) { out.innerHTML = '<span class="r-text">No proxies saved — paste host:port:user:pass lines above</span>'; return; }
+      const good = r.filter(x => x.ok).length;
+      out.innerHTML = `<div class="small" style="margin-bottom:4px">${good}/${r.length} working</div>` + r.map(x => `<div class="proxyRes"><span class="pill ${x.ok ? 'g' : 'r'}">${x.ok ? 'OK' : 'FAIL'}</span> <b>${esc(x.label)}</b> <span class="${x.ok ? '' : 'r-text'}">${x.ok ? 'exit IP ' + esc(x.ip || '?') : esc(x.error || 'dead')}</span></div>`).join('');
+    } catch (e) { out.innerHTML = `<span class="r-text">${esc(e.message)}</span>`; throw e; }
+  });
+  const pickModel = async name => {
+    await api('PUT', '/settings', { geminiModel: name });
+    $('model').value = name; toast(`Model set to ${name}`);
+  };
+  $('testG').onclick = async () => {
+    const out = $('gOut'); const btn = $('testG');
+    btn.disabled = true; out.innerHTML = '<span class="spinner"></span>Testing…';
+    try {
+      await saveKeys();   // keys pasted in the box are saved before testing
+      const r = await api('POST', '/settings/gemini/test');
+      let html = r.keys.map(k => `<div><span class="pill ${k.ok ? 'g' : 'r'}">${k.ok ? 'OK' : 'FAIL'}</span> <b>key ${esc(k.key)}</b> ${k.ok ? '' : `<span class="r-text">${esc(k.error || 'failed')}</span>`}</div>`).join('');
+      if (r.models.length) {
+        if (r.modelOk) html += `<div style="margin-top:6px">Model <b>${esc(r.model)}</b> is available ✓</div>`;
+        else {
+          html += `<div style="margin-top:6px"><span class="r-text">Model "${esc(r.model)}" is not available for these keys.</span> Pick one:</div><div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:6px">` +
+            (r.flashModels.length ? r.flashModels : r.models).map(m => `<button class="btn ghost sm gPick" data-m="${esc(m)}">${esc(m)}${m === r.suggested ? ' ★' : ''}</button>`).join('') + '</div>';
+        }
+      } else if (!r.keys.some(k => k.ok)) html += '<div class="r-text" style="margin-top:6px">No key worked — check the keys above.</div>';
+      out.innerHTML = html;
+      out.querySelectorAll('.gPick').forEach(b => { b.onclick = guard(async () => { await pickModel(b.dataset.m); out.querySelectorAll('.gPick').forEach(x => x.classList.toggle('on', x === b)); }); });
+      if (!r.modelOk && r.suggested) { await pickModel(r.suggested); out.insertAdjacentHTML('beforeend', `<div style="margin-top:6px">Auto-selected <b>${esc(r.suggested)}</b> and saved.</div>`); }
+    } catch (e) {
+      out.innerHTML = `<span class="r-text">${esc(e.message)}</span>`;
+    } finally { btn.disabled = false; }
+  };
 }
 
 // ---------------------------------------------------------------- link wizard

@@ -35,7 +35,7 @@ test/                   unit tests, e2e tests, mock YouTube Studio, mock Gemini,
 * Proxies are SOCKS5 lines in the form `host:port:user:pass` (`socks5://user:pass@host:port` also works). Chromium can't do SOCKS5 auth, so each open profile gets its own **local bridge**: an unauthenticated SOCKS5 server on `127.0.0.1:<random port>` that forwards every CONNECT through the upstream proxy with user/pass (npm `socks`). Hostnames are passed through as they are, so DNS is resolved at the proxy's exit. WebRTC is limited to proxied UDP.
 * **Health check before every open**: the app tunnels through the upstream proxy and fetches the exit IP (`proxyCheckUrl`, default ipify). If the proxy is dead, the profile **does not open** (no IP leak), the proxy is marked `bad`, and the channel retries later.
 * Launch modes: `persistent` (default; Playwright `launchPersistentContext`, headed, plus `--remote-debugging-port` so the API can return a CDP endpoint) or `cdp` (Chrome is spawned as a normal process and Playwright attaches with `connectOverCDP`; this is closer to a hand-started browser). `--enable-automation` is removed. Autopilot windows open **minimized** (through CDP `Browser.setWindowBounds`). Background throttling is turned off so minimized windows keep working. All input goes through CDP, so the app never uses the real mouse.
-* Browser binary: `browser.executablePath`, or else auto-detect (installed Google Chrome on Windows, then a Playwright Chromium in `%LOCALAPPDATA%\ms-playwright`). playwright-core does **not** bundle a browser.
+* Browser binary, in this order: `browser.executablePath` (if the file exists) → the **built-in Chromium** shipped with the installer (`resources/browsers/chromium-*/chrome-win*/chrome.exe`; in a dev checkout `./browsers`, filled by `npm run browsers:install`) → installed Google Chrome → Playwright's default download folder.
 
 ### Autopilot
 1. **Scan**: reads the top level of the channel folder for `mp4/mov/mkv/webm`. A thumbnail is a `.jpg/.jpeg/.png` with the same base name (case doesn't matter). The `Done/` subfolder, hidden files and empty files are skipped. Files are sorted naturally (`clip2` comes before `clip10`).
@@ -74,7 +74,7 @@ xvfb-run -a npm run test:e2e   # e2e (Linux needs a display or xvfb; uses a Play
 npm run smoke:electron      # Electron smoke test under xvfb (add --seed for demo data screenshots)
 npm run build               # Windows NSIS installer (electron-builder) → dist/
 ```
-On Windows you need Google Chrome installed, or run `npx playwright install chromium` once, or set Settings → Browser path.
+The Windows installer ships its own Chromium (Playwright's build matching playwright-core), so no Chrome install is needed. For a dev checkout run `npm run browsers:install` once.
 
 Building: `npm run build` builds `dist/UploadPilot Setup 0.1.0.exe` (NSIS, x64, per-user, lets you pick the install folder, desktop shortcut). Run it on Windows (or x64 Linux). `npm run build:win-dir` makes `dist/win-unpacked/UploadPilot.exe` without NSIS.
 
@@ -100,9 +100,9 @@ Security: the Host header must be loopback (blocks DNS rebinding). A request car
 | POST | `/profiles/:id/proxy` | `{proxy:"h:p:u:pw"}` or `{proxyId}` | profile |
 | POST | `/profiles/:id/proxy/check` | | `{ok, ip, ms, error?}` |
 | GET | `/proxies` | | pool (no passwords) |
-| POST | `/proxies` | `{text:"line\nline", replace?:bool}` | `{added, parsed, errors[]}` |
+| POST | `/proxies` | `{text:"line\nline", replace?:bool, sync?:bool}` (`sync`: Settings textarea semantics, `••••` lines keep their saved password) | `{added, parsed, errors[]}` (+`updated, removed, total` for sync) |
 | POST | `/proxies/:id/check` | | health check result |
-| POST | `/proxies/check-all` | | results |
+| POST | `/proxies/check-all` | `{text?}` (synced first when given) | `[{id,label,ok,ip?,error?}]` |
 | DELETE | `/proxies/:id` | | `{deleted}` |
 | GET | `/channels` | | channels with stats, live state |
 | GET | `/channels/:id` | | channel |
@@ -123,7 +123,7 @@ Security: the Host header must be loopback (blocks DNS rebinding). A request car
 | POST | `/link/:id/folder` | `{folder}` | channel active, autopilot starts |
 | DELETE | `/link/:id` | | cancels and removes the half-made profile |
 | GET / PUT | `/settings` | PUT accepts any setting, plus `proxyPool` (text, replaces the pool except proxies in use) and `geminiKeys` (text or array) | settings (keys masked) |
-| POST | `/settings/gemini/test` | | `{models[]}` |
+| POST | `/settings/gemini/test` | `{keys?: "text"}` (saved first when given) | `{keys:[{key:'…abcd', ok, error?}], models[], model, modelOk, suggested, flashModels[]}` — each key tested on its own |
 | GET | `/scheduler` | | lanes, live runs |
 | POST | `/autopilot/pause` \| `/autopilot/resume` | | `{paused}` |
 

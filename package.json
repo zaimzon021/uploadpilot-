@@ -1,7 +1,7 @@
 {
   "name": "uploadpilot",
   "productName": "UploadPilot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Auto-upload videos to many YouTube channels through YouTube Studio in isolated browser profiles",
   "main": "electron/main.js",
   "author": "UploadPilot",
@@ -16,7 +16,8 @@
     "smoke:electron": "xvfb-run -a -s \"-screen 0 1600x1000x24\" electron . --smoke --no-sandbox",
     "build": "electron-builder --win nsis --x64 --publish never",
     "build:dir": "electron-builder --dir",
-    "build:win-dir": "electron-builder --win --x64 --dir"
+    "build:win-dir": "electron-builder --win --x64 --dir",
+    "browsers:install": "node scripts/install-browser.js"
   },
   "build": {
     "appId": "com.uploadpilot.app",
@@ -58,7 +59,17 @@
       "target": [
         "dir"
       ]
-    }
+    },
+    "extraResources": [
+      {
+        "from": "browsers",
+        "to": "browsers",
+        "filter": [
+          "chromium-*/**",
+          "!chromium-headless-shell-*/**"
+        ]
+      }
+    ]
   },
   "dependencies": {
     "better-sqlite3": "^13.2.0",

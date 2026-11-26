@@ -3,16 +3,17 @@
 // resumable Files API upload, file GET (PROCESSING -> ACTIVE), generateContent, file DELETE, models list.
 const http = require('http');
 
-function startMockGemini({ rateLimitedKeys = new Set(), badKeys = new Set(), processingPolls = 1, respond } = {}) {
+function startMockGemini({ rateLimitedKeys = new Set(), badKeys = new Set(), processingPolls = 1, respond, models = ['gemini-mock-flash'] } = {}) {
   const stats = { starts: 0, uploads: 0, bytes: 0, gets: 0, generates: 0, deletes: 0, byKey: {}, prompts: [] };
   const files = new Map();
   let n = 0;
   const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://x');
-    const key = u.searchParams.get('key');
+    const key = req.headers['x-goog-api-key'] || null;
     const chunks = []; for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks);
     const json = (status, obj, headers = {}) => { res.writeHead(status, { 'Content-Type': 'application/json', ...headers }); res.end(JSON.stringify(obj)); };
+    if (u.searchParams.has('key')) return json(400, { error: { code: 400, message: 'mock: API key must be sent in the x-goog-api-key header, not ?key=' } });
     if (key) stats.byKey[key] = (stats.byKey[key] || 0) + 1;
     if (key && badKeys.has(key)) return json(403, { error: { code: 403, message: 'API key not valid' } });
     if (key && rateLimitedKeys.has(key)) return json(429, { error: { code: 429, message: 'Resource has been exhausted' } });
@@ -56,7 +57,7 @@ function startMockGemini({ rateLimitedKeys = new Set(), badKeys = new Set(), pro
       const text = typeof out === 'string' ? out : JSON.stringify(out);
       return json(200, { candidates: [{ content: { parts: [{ text }], role: 'model' }, finishReason: 'STOP' }] });
     }
-    if (req.method === 'GET' && u.pathname === '/v1beta/models') return json(200, { models: [{ name: 'models/gemini-mock-flash', supportedGenerationMethods: ['generateContent'] }] });
+    if (req.method === 'GET' && u.pathname === '/v1beta/models') return json(200, { models: models.map(n => typeof n === 'string' ? { name: `models/${n}`, supportedGenerationMethods: ['generateContent'] } : n) });
     json(404, { error: { message: `mock: no route ${req.method} ${u.pathname}` } });
   });
   return new Promise(r => server.listen(0, '127.0.0.1', () => r({ url: `http://127.0.0.1:${server.address().port}`, stats, files, rateLimitedKeys, badKeys, close: () => new Promise(c => server.close(() => c())) })));

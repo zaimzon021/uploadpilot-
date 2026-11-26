@@ -43,20 +43,47 @@ class KeyPool {
   soonestMs() { return Math.max(0, Math.min(...this.keys.map(k => k.coolUntil)) - this.now()); }
 }
 
+// YouTube limits: title 100 chars (we aim much shorter), description 5000 bytes-ish chars, tags 500 chars total.
+const LIMITS = { titleMax: 70, descriptionMax: 4990, tagsMax: 490 };
+
 function buildPrompt(style = {}, filename = '') {
   const lang = style.language || 'English';
   return [
-    'You are writing YouTube metadata for the attached video. Watch the whole video first.',
-    `Channel niche / tone: ${style.niche || 'general'}.`,
+    'You are a YouTube SEO expert writing metadata for the attached video. Watch the whole video first, then write metadata that ranks in YouTube search and gets clicks while staying 100% honest about what is in the video.',
+    `Channel niche / style note (follow it): ${style.niche || 'general'}.`,
     `Write everything in ${lang}.`,
     'Return ONLY a JSON object: {"title": string, "description": string, "tags": string[], "hashtags": string[]}.',
-    '- title: max 100 characters, catchy and accurate to what happens in the video, no clickbait lies, no surrounding quotes.',
-    '- description: 2-4 short paragraphs describing the video, natural keywords, no hashtags and no links (a footer is added automatically).',
-    '- tags: 8-15 search tags, no # sign, total under 450 characters.',
-    '- hashtags: 3-5 hashtags, each starting with #, no spaces.',
-    style.madeForKids ? '- The audience is children: keep it family friendly.' : '',
-    filename ? `Original file name (may hint at the topic): ${filename}` : '',
-  ].filter(Boolean).join('\n');
+    '',
+    'TITLE:',
+    '- SEO-optimized, engaging and click-worthy, but honest: it must match what actually happens in the video. No misleading clickbait, no fake claims, no ALL CAPS sentences, no surrounding quotes.',
+    '- SHORT: aim for 40-60 characters, never more than 70 characters.',
+    '- Put the main keyword (what people would search for) near the start of the title.',
+    '',
+    'DESCRIPTION (long and SEO-optimized):',
+    '- Aim for about 1,500-3,000 characters; never exceed 4,500 characters.',
+    '- The first 2 lines are a strong hook that contains the main keywords — they are shown above the fold, so make them count.',
+    '- Then several paragraphs describing in detail what happens in the video (scenes, moments, what the viewer will see or learn), using the main and related keywords naturally. No keyword stuffing, no lists of keywords.',
+    '- End with a short call to action (ask viewers to like, comment and subscribe).',
+    '- Plain text with paragraph breaks (\\n\\n). No links, no "<" or ">" characters, and do NOT put hashtags in the description text (they are added at the end automatically from the hashtags field).',
+    '',
+    'TAGS:',
+    '- 10-20 relevant search keywords and phrases (main keyword, variations, related topics), no # sign, total under 450 characters.',
+    '',
+    'HASHTAGS:',
+    '- 3-5 relevant hashtags, each starting with #, no spaces. They are placed at the end of the description.',
+    style.madeForKids ? '\nThe audience is children: keep everything family friendly.' : '',
+    filename ? `\nOriginal file name (may hint at the topic): ${filename}` : '',
+  ].filter(x => x !== '').join('\n');
+}
+
+/** Cut text to max chars at a word boundary (no trailing punctuation dangling). */
+function cutAtWord(text, max) {
+  const chars = [...text];
+  if (chars.length <= max) return text;
+  const cut = chars.slice(0, max + 1).join('');
+  const sp = cut.lastIndexOf(' ');
+  const out = (sp > max * 0.5 ? cut.slice(0, sp) : chars.slice(0, max).join(''));
+  return out.replace(/[\s\-–—:,;|&/]+$/, '').trim();
 }
 
 /** Parse + validate the model output. Accepts raw JSON, ```json fences, or a response object. */
@@ -81,32 +108,40 @@ function parseGeminiResponse(input) {
 
 function normalizeMeta(j) {
   if (!j || typeof j !== 'object') throw new Error('Gemini JSON is not an object');
-  let title = String(j.title || '').replace(/[\r\n]+/g, ' ').replace(/^["'“”]+|["'“”]+$/g, '').replace(/[<>]/g, '').trim();
+  let title = String(j.title || '').replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').replace(/^["'“”]+|["'“”]+$/g, '').replace(/[<>]/g, '').trim();
   if (!title) throw new Error('Gemini JSON has no title');
-  if ([...title].length > 100) { const cut = [...title].slice(0, 100).join(''); const sp = cut.lastIndexOf(' '); title = (sp > 60 ? cut.slice(0, sp) : cut).trim(); }
-  const description = String(j.description || '').replace(/[<>]/g, '').trim();
+  title = cutAtWord(title, LIMITS.titleMax);
+  let description = String(j.description || '').replace(/[<>]/g, '').replace(/\r\n/g, '\n').trim();
+  // hashtags the model left at the end of the text move to the hashtags list (they are re-added once, at the end)
+  const extraTags = [];
+  const lines = description.split('\n');
+  while (lines.length && /^\s*(#[^\s#]+\s*)+$/.test(lines[lines.length - 1])) extraTags.unshift(...lines.pop().trim().split(/\s+/));
+  description = lines.join('\n').trim();
+  if (description.length > LIMITS.descriptionMax) description = cutAtWord(description, LIMITS.descriptionMax);
   const toList = v => (Array.isArray(v) ? v : typeof v === 'string' ? v.split(/[,\n]/) : []).map(x => String(x).trim()).filter(Boolean);
   const seen = new Set();
   let tags = toList(j.tags).map(t => t.replace(/^#/, '').replace(/[<>,]/g, '').trim()).filter(t => t && !seen.has(t.toLowerCase()) && seen.add(t.toLowerCase()));
-  // YouTube limit: tags total 500 chars; keep under 450 to be safe
-  let total = 0; tags = tags.filter(t => (total += t.length + 1) <= 450);
+  // YouTube limit: 500 chars for all tags; a tag with spaces is counted with surrounding quotes, plus a comma each
+  let total = 0; tags = tags.filter(t => { const cost = t.length + (/\s/.test(t) ? 2 : 0) + 1; if (total + cost > LIMITS.tagsMax) return false; total += cost; return true; });
   const hs = new Set();
-  const hashtags = toList(j.hashtags).map(h => '#' + h.replace(/^#+/, '').replace(/\s+/g, '')).filter(h => h.length > 1 && !hs.has(h.toLowerCase()) && hs.add(h.toLowerCase())).slice(0, 15);
+  const hashtags = [...toList(j.hashtags), ...extraTags].map(h => '#' + h.replace(/^#+/, '').replace(/\s+/g, '')).filter(h => h.length > 1 && !hs.has(h.toLowerCase()) && hs.add(h.toLowerCase())).slice(0, 15);
   return { title, description, tags, hashtags };
 }
 
-/** Compose the description that will be uploaded: AI text + fixed footer + hashtags (channel + AI). */
+/** Compose the description that will be uploaded: AI text + fixed footer + hashtags (channel + AI), always < 5000 chars. */
 function composeDescription(meta, style = {}) {
-  const parts = [meta.description || ''];
-  if (style.footer) parts.push(style.footer.trim());
   const tags = [];
   const seen = new Set();
   for (const h of [...(meta.hashtags || []), ...String(style.hashtags || '').split(/[\s,]+/)]) {
     const t = h && ('#' + h.replace(/^#+/, ''));
     if (t && t.length > 1 && !seen.has(t.toLowerCase())) { seen.add(t.toLowerCase()); tags.push(t); }
   }
-  if (tags.length) parts.push(tags.join(' '));
-  return parts.filter(Boolean).join('\n\n').slice(0, 4900);
+  const tail = [style.footer ? style.footer.trim() : '', tags.slice(0, 15).join(' ')].filter(Boolean);
+  const tailLen = tail.reduce((n, t) => n + t.length + 2, 0);
+  let body = String(meta.description || '').trim();
+  const budget = LIMITS.descriptionMax - tailLen;
+  if (body.length > budget) body = budget > 0 ? cutAtWord(body, budget) : '';
+  return [body, ...tail].filter(Boolean).join('\n\n').slice(0, LIMITS.descriptionMax);
 }
 
 class GeminiClient {
@@ -126,9 +161,9 @@ class GeminiClient {
   async uploadFile(k, filePath) {
     const size = fs.statSync(filePath).size;
     const mime = MIME[path.extname(filePath).toLowerCase()] || 'video/mp4';
-    let res = await this.fetch(`${this.base}/upload/v1beta/files?key=${encodeURIComponent(k.key)}`, {
+    let res = await this.fetch(`${this.base}/upload/v1beta/files`, {
       method: 'POST',
-      headers: { 'X-Goog-Upload-Protocol': 'resumable', 'X-Goog-Upload-Command': 'start', 'X-Goog-Upload-Header-Content-Length': String(size), 'X-Goog-Upload-Header-Content-Type': mime, 'Content-Type': 'application/json' },
+      headers: { 'x-goog-api-key': k.key, 'X-Goog-Upload-Protocol': 'resumable', 'X-Goog-Upload-Command': 'start', 'X-Goog-Upload-Header-Content-Length': String(size), 'X-Goog-Upload-Header-Content-Type': mime, 'Content-Type': 'application/json' },
       body: JSON.stringify({ file: { display_name: path.basename(filePath) } }),
     });
     if (!res.ok) throw this._err(res, await this._json(res), 'Files API start');
@@ -153,7 +188,7 @@ class GeminiClient {
       if (f.state === 'FAILED') throw new GeminiError(`Gemini could not process the video (${f.error?.message || 'FAILED'})`, 422);
       if (Date.now() - t0 > this.activeTimeoutMs) throw new GeminiError('Timed out waiting for Gemini to process the video', 504);
       await this.sleep(this.pollMs);
-      const res = await this.fetch(`${this.base}/v1beta/${f.name}?key=${encodeURIComponent(k.key)}`);
+      const res = await this.fetch(`${this.base}/v1beta/${f.name}`, { headers: { 'x-goog-api-key': k.key } });
       const body = await this._json(res);
       if (!res.ok) throw this._err(res, body, 'Files API get');
       f = body;
@@ -162,12 +197,12 @@ class GeminiClient {
   }
 
   async deleteFile(k, file) {
-    try { await this.fetch(`${this.base}/v1beta/${file.name}?key=${encodeURIComponent(k.key)}`, { method: 'DELETE' }); } catch (_) { /* best effort */ }
+    try { await this.fetch(`${this.base}/v1beta/${file.name}`, { method: 'DELETE', headers: { 'x-goog-api-key': k.key } }); } catch (_) { /* best effort */ }
   }
 
   async generate(k, file, prompt) {
-    const res = await this.fetch(`${this.base}/v1beta/models/${encodeURIComponent(this.model)}:generateContent?key=${encodeURIComponent(k.key)}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const res = await this.fetch(`${this.base}/v1beta/models/${encodeURIComponent(this.model)}:generateContent`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k.key },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ file_data: { mime_type: file.mimeType, file_uri: file.uri } }, { text: prompt }] }],
         generationConfig: { responseMimeType: 'application/json', responseSchema: RESPONSE_SCHEMA, temperature: 0.8 },
@@ -206,14 +241,40 @@ class GeminiClient {
     throw lastErr || new GeminiError('Gemini failed', 500);
   }
 
-  async listModels() {
-    const k = this.pool.next();
-    if (!k) throw new GeminiError('No Gemini API keys configured', 400);
-    const res = await this.fetch(`${this.base}/v1beta/models?key=${encodeURIComponent(k.key)}&pageSize=200`);
+  /** Raw model list for one key (key sent in the x-goog-api-key header; any key format, e.g. AIza… or AQ.…). */
+  async _listModelsWith(key) {
+    const res = await this.fetch(`${this.base}/v1beta/models?pageSize=200`, { headers: { 'x-goog-api-key': key } });
     const body = await this._json(res);
     if (!res.ok) throw this._err(res, body, 'list models');
     return (body.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name.replace(/^models\//, ''));
   }
+
+  async listModels() {
+    const k = this.pool.next();
+    if (!k) throw new GeminiError('No Gemini API keys configured', 400);
+    return this._listModelsWith(k.key);
+  }
+
+  /** Check every key on its own: [{ key: '…abcd', ok, models?, error? }]. */
+  async testKeys() {
+    if (!this.pool.size) throw new GeminiError('No Gemini API keys configured', 400);
+    const out = [];
+    for (const k of this.pool.keys) {
+      try { const models = await this._listModelsWith(k.key); out.push({ key: '…' + k.key.slice(-4), ok: true, models }); }
+      catch (e) { out.push({ key: '…' + k.key.slice(-4), ok: false, error: e.message, status: e.status || null }); }
+    }
+    return out;
+  }
 }
 
-module.exports = { GeminiClient, KeyPool, parseGeminiResponse, normalizeMeta, composeDescription, buildPrompt, keyHash, GeminiError, RESPONSE_SCHEMA };
+/** Best Gemini "flash" model for video metadata among names that support generateContent: stable > preview,
+ *  newest version first, full flash before flash-lite. Skips image/tts/audio/live/embedding variants. */
+function pickBestModel(models = []) {
+  const ver = n => { const m = /gemini-(\d+(?:\.\d+)?)/.exec(n); return m ? parseFloat(m[1]) : 0; };
+  const cands = models.filter(n => /flash/i.test(n) && !/(image|tts|audio|live|embed|thinking|computer|robotics)/i.test(n));
+  const rank = n => [/(preview|exp)/i.test(n) ? 1 : 0, -ver(n), /lite/i.test(n) ? 1 : 0, /latest/i.test(n) ? 1 : 0, n.length];
+  cands.sort((a, b) => { const x = rank(a), y = rank(b); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i]; return a.localeCompare(b); });
+  return cands[0] || null;
+}
+
+module.exports = { GeminiClient, pickBestModel, cutAtWord, LIMITS, KeyPool, parseGeminiResponse, normalizeMeta, composeDescription, buildPrompt, keyHash, GeminiError, RESPONSE_SCHEMA };

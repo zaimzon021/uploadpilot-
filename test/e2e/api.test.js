@@ -45,6 +45,12 @@ test('health, dashboard, events, settings', async () => {
   await ok('PUT', '/settings', { geminiBaseUrl: gemini.url });
   const m = await ok('POST', '/settings/gemini/test'); track('POST', '/settings/gemini/test');
   assert.deepStrictEqual(m.models, ['gemini-mock-flash']);
+  assert.deepStrictEqual(m.keys.map(k => [k.key, k.ok]), [['…1234', true], ['…5678', true]]);
+  assert.strictEqual(m.modelOk, false); assert.strictEqual(m.suggested, 'gemini-mock-flash');
+  // a key pasted but not saved (newer AQ.… format) is saved by Test itself and checked on its own
+  const m2 = await ok('POST', '/settings/gemini/test', { keys: 'AQ.Ab8RNnew-style.key9' });
+  assert.deepStrictEqual(m2.keys.map(k => [k.key, k.ok]), [['…key9', true]]);
+  assert.strictEqual((await ok('GET', '/settings')).geminiKeyCount, 1);
 });
 
 test('proxies: add, list, check, check-all, delete', async () => {
@@ -61,6 +67,18 @@ test('proxies: add, list, check, check-all, delete', async () => {
   assert.deepStrictEqual(all.map(x => x.ok).sort(), [false, true]);
   const dead = list.find(p => p.port !== px.port);
   assert.strictEqual((await ok('DELETE', `/proxies/${dead.id}`)).deleted, true); track('DELETE', '/proxies/:id');
+  // Settings textarea flow: Check all with unsaved pasted lines saves them first, masked lines keep passwords
+  const pasted = `${px.line}\n10.255.255.2:1081:u2:p2\n10.255.255.3:1082:u3:p3`;
+  const all3 = await ok('POST', '/proxies/check-all', { text: pasted });
+  assert.strictEqual(all3.length, 3);
+  assert.ok(all3.find(x => x.ok && x.ip === '192.0.2.10'));
+  assert.ok(all3.filter(x => !x.ok).every(x => x.error), 'failures carry error text');
+  const shown = (await ok('GET', '/settings')).proxyPoolText;
+  const synced = await ok('POST', '/proxies', { sync: true, text: shown.split('\n').slice(0, 1).join('\n') });
+  assert.deepStrictEqual([synced.removed, synced.total], [2, 1]);
+  assert.strictEqual((await ok('POST', `/proxies/${good.id}/check`)).ok, true, 'masked line kept the saved password');
+  assert.deepStrictEqual(await ok('POST', '/proxies/check-all', { text: '' }), []);
+  await ok('POST', '/proxies', { text: px.line });
 });
 
 let profId;

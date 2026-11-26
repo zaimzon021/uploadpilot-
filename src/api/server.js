@@ -41,9 +41,9 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
   add('POST', `${P}/profiles/:id/proxy/check`, async ({ p }) => { const prof = need(app.profiles.getProfile(int(p.id))); if (!prof.proxy_id) throw Object.assign(new Error('Profile has no proxy'), { status: 400 }); return app.profiles.checkProxyById(prof.proxy_id); });
   // ---- proxies
   add('GET', `${P}/proxies`, () => app.profiles.listProxies());
-  add('POST', `${P}/proxies`, ({ body }) => body.replace ? app.profiles.replaceProxyPool(body.text || '') : app.profiles.addProxies(body.text || body.proxy || ''));
+  add('POST', `${P}/proxies`, ({ body }) => body.sync ? app.profiles.syncProxyPool(body.text || '') : body.replace ? app.profiles.replaceProxyPool(body.text || '') : app.profiles.addProxies(body.text || body.proxy || ''));
   add('POST', `${P}/proxies/:id/check`, ({ p }) => app.profiles.checkProxyById(int(p.id)));
-  add('POST', `${P}/proxies/check-all`, async () => { const out = []; for (const x of app.profiles.listProxies()) out.push(await app.profiles.checkProxyById(x.id)); return out; });
+  add('POST', `${P}/proxies/check-all`, async ({ body }) => { if (body && typeof body.text === 'string') app.profiles.syncProxyPool(body.text); const out = []; for (const x of app.profiles.listProxies()) out.push(await app.profiles.checkProxyById(x.id)); return out; });
   add('DELETE', `${P}/proxies/:id`, ({ p }) => ({ deleted: app.db.run('DELETE FROM proxies WHERE id=?', int(p.id)).changes > 0 }));
   // ---- channels
   add('GET', `${P}/channels`, () => app.listChannels());
@@ -77,7 +77,16 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
   // ---- settings / autopilot
   add('GET', `${P}/settings`, () => ({ ...app.settings.publicView(), proxyPoolText: app.profiles.listProxies().map(x => `${x.host}:${x.port}${x.username ? ':' + x.username + ':••••' : ''}`).join('\n') }));
   add('PUT', `${P}/settings`, ({ body }) => app.updateSettings(body));
-  add('POST', `${P}/settings/gemini/test`, async () => ({ models: await app.geminiClient().listModels() }));
+  add('POST', `${P}/settings/gemini/test`, async ({ body }) => {
+    // keys pasted but not saved yet are saved first, so Test never says "no keys" for what the user sees
+    if (body && typeof body.keys === 'string' && body.keys.trim()) await app.updateSettings({ geminiKeys: body.keys });
+    const keys = await app.geminiClient().testKeys();
+    const models = [...new Set(keys.filter(k => k.ok).flatMap(k => k.models))];
+    for (const k of keys) delete k.models;
+    const model = app.settings.all().geminiModel;
+    const { pickBestModel } = require('../ai/gemini');
+    return { keys, models, model, modelOk: models.includes(model), suggested: models.length && !models.includes(model) ? pickBestModel(models) : null, flashModels: models.filter(n => /flash/i.test(n)) };
+  });
   add('GET', `${P}/scheduler`, () => ({ ...(app.scheduler ? app.scheduler.status() : {}), live: [...app.runner.live.entries()].map(([id, l]) => ({ channelId: id, ...l })) }));
   add('POST', `${P}/autopilot/pause`, () => app.setAutopilotPaused(true));
   add('POST', `${P}/autopilot/resume`, () => app.setAutopilotPaused(false));

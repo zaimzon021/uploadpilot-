@@ -15,10 +15,32 @@ jobs:
       - run: npm ci
       - name: Unit tests
         run: npm test
+      # Ship our own Chromium (full build, not headless-shell) so users need no Chrome installed.
+      # Version matches the installed playwright-core; lands in resources/browsers via build.extraResources.
+      - name: Download bundled Chromium
+        run: node scripts/install-browser.js
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}\browsers
+      - name: List bundled browser
+        shell: pwsh
+        run: |
+          Get-ChildItem browsers
+          $exe = Get-ChildItem browsers -Recurse -Filter chrome.exe | Select-Object -First 1
+          if (-not $exe) { throw "chrome.exe not found under browsers/" }
+          "Bundled chrome.exe: $($exe.FullName) ($([math]::Round($exe.Length/1MB,1)) MB)"
+          "browsers folder total: $([math]::Round(((Get-ChildItem browsers -Recurse -File | Measure-Object Length -Sum).Sum)/1MB,1)) MB"
       - name: Build installer
         run: npm run build
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - name: Verify chrome.exe is inside the packaged app
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist/win-unpacked/resources/browsers -Recurse -Filter chrome.exe | Select-Object -First 1
+          if (-not $exe) { throw "Bundled chrome.exe missing from dist/win-unpacked/resources/browsers" }
+          "Packaged: $($exe.FullName)"
+          Get-ChildItem dist/win-unpacked/resources/browsers
+          Get-ChildItem dist/*.exe | ForEach-Object { "Installer: $($_.Name) $([math]::Round($_.Length/1MB,1)) MB" }
       - uses: actions/upload-artifact@v4
         with:
           name: UploadPilot-Setup
