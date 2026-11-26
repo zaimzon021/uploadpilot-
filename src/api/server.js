@@ -28,11 +28,20 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
   });
   // ---- cloud (v0.3)
   add('GET', `${P}/cloud/status`, () => app.cloud.status());
-  add('POST', `${P}/cloud/signin`, async ({ body }) => app.cloud.signIn(body.email, body.password, { create: !!body.create }));
+  add('POST', `${P}/cloud/signin`, async ({ body }) => { const st = await app.cloud.signIn(body.email, body.password, { create: !!body.create }); if (app.onBecameActive && st.activePc && st.activePc.me) app.onBecameActive(); return st; });
   add('POST', `${P}/cloud/signout`, () => app.cloud.signOut());
   add('POST', `${P}/cloud/offline`, () => app.cloud.useOffline());
   add('POST', `${P}/cloud/reconnect`, () => app.cloud.reconnect());
-  add('POST', `${P}/cloud/passphrase`, ({ body }) => app.cloud.setPassphrase(body.passphrase, { force: !!body.force }));
+  // v0.3.1: account key (no sync passphrase), single active PC
+  add('POST', `${P}/cloud/legacy-passphrase`, ({ body }) => app.cloud.migrateLegacy(body.passphrase));
+  add('POST', `${P}/cloud/passphrase`, ({ body }) => app.cloud.migrateLegacy(body.passphrase));   // 0.3.0 name, same meaning now
+  add('POST', `${P}/cloud/unlock`, ({ body }) => app.cloud.unlock(body.password));
+  add('POST', `${P}/cloud/key-request`, () => app.cloud.requestKey());
+  add('POST', `${P}/cloud/start-fresh`, ({ body }) => app.cloud.startFresh(body.password));
+  add('POST', `${P}/cloud/password`, ({ body }) => app.cloud.changePassword(body.oldPassword, body.newPassword));
+  add('POST', `${P}/cloud/forgot`, ({ body }) => app.cloud.forgotPassword(body.email));
+  add('POST', `${P}/cloud/takeover`, async () => { const r = await app.cloud.takeOver(); if (app.onBecameActive) app.onBecameActive(); return r; });
+  add('GET', `${P}/needs-you`, () => app.needsYou());
   add('POST', `${P}/cloud/drive/connect`, () => app.cloud.connectDrive());
   add('POST', `${P}/cloud/drive/disconnect`, () => app.cloud.disconnectDrive());
   add('POST', `${P}/cloud/backup/run`, async () => { if (!app.cloud.backup) throw Object.assign(new Error('Cloud sync is not on'), { status: 409 }); const r = await app.cloud.backup.tick(); return { uploaded: !!r, status: app.cloud.backup.status() }; });
@@ -74,7 +83,7 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
     if (!ch.profile_id) throw Object.assign(new Error('Channel has no profile'), { status: 409 });
     if (app.runner.live.has(ch.id)) throw Object.assign(new Error('Autopilot is uploading on this profile right now'), { status: 409 });
     const s = await app.profiles.open(ch.profile_id, { purpose: 'manual', startUrl: app.settings.get('urls').studio });
-    return { profileId: ch.profile_id, ws: s.cdpEndpoint, exitIp: s.exitIp };
+    return { profileId: ch.profile_id, ws: s.cdpEndpoint, exitIp: s.exitIp, signIn: !!(s.landing && s.landing.signIn), url: s.landing ? s.landing.url : null };
   });
   add('GET', `${P}/channels/:id/videos`, ({ p }) => app.listVideos(int(p.id)));
   add('GET', `${P}/channels/:id/runs`, ({ p }) => app.db.all('SELECT * FROM runs WHERE channel_id=? ORDER BY id DESC LIMIT 50', int(p.id)));

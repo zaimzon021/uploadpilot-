@@ -65,8 +65,45 @@ function detectExecutable(cfg = {}, opts = {}) {
   return candidates.find(exists) || null;
 }
 
+// Google "Device Bound Session Credentials" (DBSC). On Windows, Chromium ≥145 binds a Google sign-in to a
+// key in the PC's TPM: the short-lived __Secure-1PSIDTS / __Secure-3PSIDTS cookies are only refreshed
+// with a signature from that key. A storageState copied to another PC then signs out within minutes.
+// UploadPilot moves logins between PCs, so these features are switched off for every profile.
+// Names checked against the bundled Chromium (Playwright build 1255 = Chrome for Testing 159).
+const DBSC_DISABLED_FEATURES = [
+  'EnableBoundSessionCredentials', 'EnableBoundSessionCredentialsContinuity',
+  'DeviceBoundSessions', 'DeviceBoundSessionsFederatedRegistration', 'DeviceBoundSessionsForRestrictedSites', 'DeviceBoundSessionsForSingleSignOn',
+];
+
+let _pwDefaults;
+/** The --disable-features list Playwright itself passes (Chromium keeps only the LAST --disable-features switch). */
+function playwrightDisabledFeatures() {
+  if (_pwDefaults !== undefined) return _pwDefaults;
+  _pwDefaults = null;
+  try {
+    const dir = path.dirname(require.resolve('playwright-core/package.json'));
+    for (const f of ['lib/coreBundle.js', 'lib/server/chromium/chromiumSwitches.js']) {
+      const file = path.join(dir, f);
+      if (!fs.existsSync(file)) continue;
+      const src = fs.readFileSync(file, 'utf8');
+      const m = /disabledFeatures\s*=\s*\[([\s\S]*?)\]\s*\.filter\(Boolean\)/.exec(src);
+      if (m) { _pwDefaults = [...m[1].replace(/\/\/.*$/gm, '').matchAll(/^\s*"([A-Za-z0-9_]+)"\s*,?\s*$/gm)].map(x => x[1]); break; }
+    }
+  } catch (_) { _pwDefaults = null; }
+  return _pwDefaults;
+}
+
+function disableFeaturesArg(extra = []) {
+  const list = [...new Set([...(playwrightDisabledFeatures() || []), ...DBSC_DISABLED_FEATURES, ...extra])];
+  return `--disable-features=${list.join(',')}`;
+}
+
 function buildArgs({ proxyUrl, windowMode, debugPort, extraArgs = [] }) {
+  // a user-supplied --disable-features is merged into ours (Chromium honours only one)
+  const userDisabled = extraArgs.filter(a => a.startsWith('--disable-features=')).flatMap(a => a.slice('--disable-features='.length).split(',').filter(Boolean));
+  extraArgs = extraArgs.filter(a => !a.startsWith('--disable-features='));
   const args = [
+    disableFeaturesArg(userDisabled),
     '--no-first-run', '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
     // keep background/minimized windows fully alive so uploads don't stall
@@ -132,7 +169,8 @@ async function launchProfileBrowser({ userDataDir, proxyUrl, cfg, windowMode, he
   } else {
     context = await chromium.launchPersistentContext(userDataDir, {
       executablePath, channel: cfg.channel || undefined, headless: !!headless, args,
-      ignoreDefaultArgs: ['--enable-automation'], viewport: null, acceptDownloads: false,
+      // Playwright's own --disable-features is replaced by ours, which contains its list + the DBSC features
+      ignoreDefaultArgs: ['--enable-automation', ...(playwrightDisabledFeatures() ? ['--disable-features=' + playwrightDisabledFeatures().join(',')] : [])], viewport: null, acceptDownloads: false,
     });
   }
   let cdpEndpoint = null;
@@ -149,4 +187,4 @@ async function launchProfileBrowser({ userDataDir, proxyUrl, cfg, windowMode, he
   return { context, browser, cdpEndpoint, debugPort, executablePath, close, isClosed: () => closed };
 }
 
-module.exports = { launchProfileBrowser, detectExecutable, chromiumInBrowsersDir, bundledBrowserRoots, buildArgs, freePort, waitForCdp };
+module.exports = { DBSC_DISABLED_FEATURES, playwrightDisabledFeatures, disableFeaturesArg, launchProfileBrowser, detectExecutable, chromiumInBrowsersDir, bundledBrowserRoots, buildArgs, freePort, waitForCdp };

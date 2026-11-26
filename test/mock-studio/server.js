@@ -30,7 +30,7 @@ function startMockStudio({ port = 0 } = {}) {
     }
     if (p === '/__ip') return send(res, 200, JSON.stringify({ ip: '203.0.113.77' }), 'application/json');
     if (p === '/__submissions') return send(res, 200, JSON.stringify(state.submissions), 'application/json');
-    if (p === '/__reset' && req.method === 'POST') { state.submissions = []; state.mode = 'ok'; state.opts = {}; state.errorShown = 0; state.vanished = 0; state.uploadsStarted = 0; return send(res, 200, '{}', 'application/json'); }
+    if (p === '/__reset' && req.method === 'POST') { state.drafts = []; state.submissions = []; state.mode = 'ok'; state.opts = {}; state.errorShown = 0; state.vanished = 0; state.uploadsStarted = 0; return send(res, 200, '{}', 'application/json'); }
 
     // ---- Google sign-in mock
     if (p === '/ServiceLogin' || p === '/signin') return send(res, 200, page('login.html'));
@@ -52,6 +52,13 @@ function startMockStudio({ port = 0 } = {}) {
       if (!sid || mode === 'login') return send(res, 302, '', 'text/plain', { Location: `/ServiceLogin?continue=${encodeURIComponent('/')}` });
       if (mode === 'verify') return send(res, 302, '', 'text/plain', { Location: '/challenge/recaptcha?continue=/' });
       if (p === '/') return send(res, 302, '', 'text/plain', { Location: `/channel/${CHANNEL_ID}` });
+      // Content -> Videos list (duplicate check before a retry): published submissions + leftover drafts
+      if (/\/videos(\/upload)?$/.test(p)) {
+        const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        const rows = [...state.submissions.map(x => ({ title: x.title, id: x.videoId, draft: false })), ...(state.drafts || []).map((d, i) => ({ title: d.title, id: 'draft' + i, draft: true }))];
+        const html = `<!doctype html><title>Channel content</title><ytcp-app><div id="content">${rows.map(r => `<ytcp-video-row style="display:block"><div id="row-container"><a id="video-title" href="/video/${r.id}/edit">${esc(r.title)}</a><span>${r.draft ? 'Draft <button>Edit draft</button>' : 'Public'}</span></div></ytcp-video-row>`).join('')}</div></ytcp-app>`;
+        return send(res, 200, html);
+      }
       return send(res, 200, page('studio.html'));
     }
     send(res, 404, 'not found');

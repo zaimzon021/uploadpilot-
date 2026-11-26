@@ -49,7 +49,7 @@ class Human {
   async type(text) {
     const { minDelay, maxDelay, humanChars } = this.typing;
     let typed = 0;
-    const lines = String(text).split('\n');
+    const lines = String(text ?? '').split('\n');
     for (let li = 0; li < lines.length; li++) {
       const line = Array.from(lines[li]); // code points, so emoji / surrogate pairs are never split
       let i = 0;

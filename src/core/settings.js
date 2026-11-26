@@ -10,7 +10,10 @@ const DEFAULTS = {
   geminiModel: 'gemini-3.5-flash-lite',
   geminiBaseUrl: 'https://generativelanguage.googleapis.com',
   geminiMaxAttempts: 4,
-  aiLookaheadDays: 0,                       // 0 = Gemini writes metadata for today's videos only; 1 = also tomorrow's (handy in approval mode)
+  aiLookaheadDays: 0,                       // only used when aiWriteAhead is false (0.3.0 behaviour: today's videos only)
+  aiWriteAhead: true,                       // 0.3.1: Gemini writes metadata as soon as a video is found, earliest slot first
+  aiMinGapMs: 4000,                         // rate limit: at least this long between two Gemini jobs starting
+  aiInlineTimeoutMs: 5 * 60000,             // a due video without metadata waits this long for Gemini, then gets a clean title from its file name
   aiConcurrency: 2,
   aiTickMs: 20000,
   apiPort: 53300,
@@ -42,6 +45,8 @@ const DEFAULTS = {
     visibility: 'PUBLIC',                   // PUBLIC | UNLISTED | PRIVATE | SCHEDULE
     moveDoneFiles: true,
   },
+  retry: { max: 3, backoffMin: [5, 15, 45], jitterPct: 20 },   // failed uploads: automatic retries, inside the upload window only
+  keepAlive: { enabled: true, idleHours: 24, staySec: 20, tickMs: 10 * 60000 },   // daily youtube.com visit for unused profiles (fresh cookies)
   schedulerTickMs: 30000,
   allowNoProxy: false,                      // link channels without a proxy (not recommended)
   autopilotPaused: false,                   // global pause switch
@@ -50,6 +55,9 @@ const DEFAULTS = {
   logRetentionDays: 14,
   cloud: {
     mode: 'auto',                           // 'auto' (sign in when a config exists) | 'cloud' | 'offline' (user picked "Use offline")
+    singleActivePc: true,                   // 0.3.1: one active PC per account (hand-over between PCs)
+    handedOverTo: '',                       // set after this PC handed over / lost the active role (stays quiet until signed in again)
+    verifyAfterRestore: true,               // after a login restore, open youtube.com once and check the account is signed in
     firebaseConfig: '',                     // web app config JSON from the Firebase console (or config/cloud-config.json)
     googleClientId: '', googleClientSecret: '',   // OAuth Desktop client override; the secret itself is sealed in secrets.json (never stored here)
     pcId: '', pcName: '', lastEmail: '',

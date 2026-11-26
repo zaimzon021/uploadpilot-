@@ -168,7 +168,7 @@ test('profile login sync: storageState exported on close (encrypted, Drive), imp
   // the user signs in to Google inside the window
   profileStates.set(profA.data_dir, { cookies: [{ name: 'SID', value: 'secret-session', domain: '.google.com', path: '/', expires: -1, httpOnly: true, secure: true, sameSite: 'Lax' }], origins: [{ origin: 'https://studio.youtube.com', localStorage: [{ name: 'k', value: 'v' }], indexedDB: [] }] });
   await A.app.profiles.close(profileId);
-  const file = drive.byName(`profile-${profA.cloud_id}.state`);
+  const file = drive.byName(`profile-${profA.cloud_id}-v1.state`);
   assert.ok(file, 'snapshot in UploadPilot/profiles');
   assert.ok(!file.data.toString('latin1').includes('secret-session'), 'encrypted');
   const doc = server.docs.get(`users/${uid(A)}/profiles/${profA.cloud_id}`).data;
@@ -183,14 +183,13 @@ test('profile login sync: storageState exported on close (encrypted, Drive), imp
   const bProf = await waitFor(() => { const p = B.app.db.get('SELECT * FROM profiles WHERE cloud_id=?', profA.cloud_id); return p && p.cloud_state_version === 1 && p; }, { what: 'state version on B' });
   await B.app.profiles.open(bProf.id, { purpose: 'manual', startUrl: 'https://studio.youtube.com' });
   const ops = B.calls.filter(c => c.dir === bProf.data_dir).map(c => c.op);
-  assert.deepStrictEqual(ops, ['launch', 'setStorageState', 'goto'], 'imported before navigation');
+  assert.deepStrictEqual(ops, ['launch', 'setStorageState', 'addCookies', 'goto'], 'imported before navigation');
   assert.strictEqual(profileStates.get(bProf.data_dir).cookies[0].value, 'secret-session');
   assert.strictEqual(B.app.db.get('SELECT state_version FROM profiles WHERE id=?', bProf.id).state_version, 1);
   await B.app.profiles.close(bProf.id);
-  // wrong passphrase on a third PC: can't decrypt, warns, opens anyway with its own (empty) state
-  const C = await makePc(w.server, drive, 'PC-C', { passphrase: null });
-  await assert.rejects(C.app.cloud.setPassphrase('a-different-pass'), e => e.status === 409);
-  await C.app.cloud.setPassphrase('shared-sync-pass');
+  // a third PC signed in with the same account password unlocks the same account key (no passphrase)
+  const C = await makePc(w.server, drive, 'PC-C', {});
+  assert.strictEqual(C.app.cloud.keys.keyIdV, A.app.cloud.keys.keyIdV);
   await C.app.stop();
   await w.close();
 });

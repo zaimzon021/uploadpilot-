@@ -125,3 +125,30 @@ test('daily upload limit dialog -> UploadLimit error', async () => {
   await assert.rejects(e.uploadVideo(await freshPage(), job(), { deadline: Date.now() + 60000 }), err => err.code === 'UPLOAD_LIMIT');
 });
 
+
+test('v0.3.1 repro: a job with title null (the "uploading \\"null\\"" crash: Cannot read properties of null (reading \'replace\')) uploads with a clean file-name title', async () => {
+  await studio.setMode('ok');
+  const page = await freshPage();
+  const { e } = engine('null-title');
+  const r = await e.uploadVideo(page, { ...job(), title: null, description: null, tags: null }, { deadline: Date.now() + 120000 });
+  assert.match(r.url, /youtu\.be/);
+  assert.strictEqual(lastSub().title, 'Clip 001');
+});
+
+test('v0.3.1 duplicate check before a retry: finds an earlier published upload (by title) or a leftover draft (by file name) in the content list', async () => {
+  await studio.setMode('ok');
+  const page = await freshPage();
+  const { e } = engine('dupcheck');
+  const pub = lastSub();
+  const f1 = await e.findExisting(page, { channelId: studio.channelId, title: pub.title, filename: 'nothing.mp4' });
+  assert.strictEqual(f1.checked, true);
+  assert.ok(f1.match && !f1.match.draft, JSON.stringify(f1));
+  assert.strictEqual(f1.match.url, `https://youtu.be/${pub.videoId}`);
+  studio.state.drafts = [{ title: 'clip_777' }];
+  const f2 = await e.findExisting(page, { channelId: studio.channelId, title: 'Some New Title', filename: 'clip_777.mp4' });
+  assert.ok(f2.match && f2.match.draft, JSON.stringify(f2));
+  const f3 = await e.findExisting(page, { channelId: studio.channelId, title: 'Never Uploaded', filename: 'x.mp4' });
+  assert.deepStrictEqual([f3.checked, f3.match], [true, null]);
+  assert.strictEqual((await e.findExisting(page, { channelId: null, title: 'x' })).checked, false);
+  studio.state.drafts = [];
+});

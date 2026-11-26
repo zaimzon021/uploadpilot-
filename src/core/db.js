@@ -83,6 +83,9 @@ class DB {
     add('channels', [...common, ['folder_pc', 'TEXT'], ['folder_pc_name', 'TEXT']]);
     add('profiles', [...common, ['state_version', 'INTEGER DEFAULT 0'], ['state_hash', 'TEXT'], ['cloud_state_version', 'INTEGER DEFAULT 0'], ['cloud_state_hash', 'TEXT'], ['cloud_state_file', 'TEXT'], ['cloud_state_by', 'TEXT']]);
     add('videos', [...common, ['remote', 'INTEGER DEFAULT 0'], ['origin_pc', 'TEXT'], ['origin_pc_name', 'TEXT'], ['drive_file_id', 'TEXT'], ['backup_error', 'TEXT']]);
+    // v0.3.1: automatic retry of failed uploads, where the metadata came from, login health per profile
+    add('videos', [['retry_at', 'INTEGER'], ['retry_count', 'INTEGER DEFAULT 0'], ['error_kind', 'TEXT'], ['meta_source', 'TEXT']]);
+    add('profiles', [['login_state', 'TEXT'], ['login_note', 'TEXT'], ['keepalive_at', 'INTEGER']]);
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_cloud ON channels(cloud_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_cloud ON profiles(cloud_id);
@@ -96,6 +99,8 @@ class DB {
     `);
     // Local edits mark a row dirty (pushed to the cloud later); rows written by the sync itself
     // (sync_ctx.applying = 1) don't, so remote changes never bounce back.
+    // 0.3.1 adds synced columns: rebuild the update triggers so they watch the new list
+    for (const t of ['channels', 'profiles', 'videos']) this.db.exec(`DROP TRIGGER IF EXISTS trg_${t}_upd`);
     const trig = (t, colsList) => this.db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_${t}_ins AFTER INSERT ON ${t} WHEN (SELECT applying FROM sync_ctx WHERE id=1) = 0
         BEGIN UPDATE ${t} SET dirty = 1 WHERE id = NEW.id; END;
@@ -105,7 +110,7 @@ class DB {
         BEGIN INSERT OR REPLACE INTO sync_tombstones(kind, cloud_id, ts) VALUES ('${t}', OLD.cloud_id, CAST(strftime('%s','now') AS INTEGER) * 1000); END;`);
     trig('channels', 'name, handle, yt_channel_id, folder, style, status, status_reason, paused_until, profile_id, last_run');
     trig('profiles', 'number, name, proxy_id');
-    trig('videos', 'status, scheduled_at, title, description, tags, hashtags, edited, ai_status, ai_error, url, error, attempts, uploaded_at, drive_file_id, filename, size');
+    trig('videos', 'status, scheduled_at, title, description, tags, hashtags, edited, ai_status, ai_error, url, error, attempts, uploaded_at, drive_file_id, filename, size, retry_at, retry_count, error_kind');
   }
 
   /** Run fn with change tracking off (used when applying changes that came from the cloud). */

@@ -70,4 +70,70 @@ const VERIFIER_TEXT = 'uploadpilot-sync-ok';
 const makeVerifier = pass => encryptString(VERIFIER_TEXT, pass);
 function checkVerifier(verifier, pass) { try { return decryptString(verifier, pass) === VERIFIER_TEXT; } catch (_) { return false; } }
 
-module.exports = { deriveKey, encryptBuffer, decryptBuffer, encryptJson, decryptJson, encryptString, decryptString, canonical, sha256, storageStateHash, makeVerifier, checkVerifier, MAGIC };
+// ---------------------------------------------------------------- v0.3.1: account data key (envelope encryption)
+// One random 256-bit data key per account encrypts everything that follows the account (profile logins,
+// proxy passwords, Gemini keys, settings, Drive token). The data key itself is stored in Firestore only
+// "wrapped" with a key derived (scrypt) from the account password, so Firebase alone can't read anything.
+//   data blob:   "UPK1" | iv(12) | tag(16) | ciphertext( gzip?(plaintext) )
+//   wrapped key: "UPW1" | salt(16) | iv(12) | tag(16) | ciphertext(32-byte data key)       (base64 text)
+const KMAGIC = Buffer.from('UPK1');
+const WMAGIC = Buffer.from('UPW1');
+const newDataKey = () => crypto.randomBytes(32);
+const keyId = key => sha256(Buffer.concat([Buffer.from('uploadpilot-key-id:'), key])).slice(0, 16);
+
+function encryptWithKey(plain, key, { compress = true } = {}) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+  c.setAAD(KMAGIC);
+  const ct = Buffer.concat([c.update(compress ? zlib.gzipSync(plain) : plain), c.final()]);
+  return Buffer.concat([KMAGIC, Buffer.from([compress ? 1 : 0]), iv, c.getAuthTag(), ct]);
+}
+function decryptWithKey(blob, key) {
+  if (!Buffer.isBuffer(blob) || blob.length < 33 || !blob.subarray(0, 4).equals(KMAGIC)) throw Object.assign(new Error('Not an UploadPilot account-key blob'), { code: 'BAD_BLOB' });
+  const compressed = blob[4] === 1, iv = blob.subarray(5, 17), tag = blob.subarray(17, 33), ct = blob.subarray(33);
+  const d = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  d.setAAD(KMAGIC); d.setAuthTag(tag);
+  let body;
+  try { body = Buffer.concat([d.update(ct), d.final()]); } catch (_) { throw Object.assign(new Error('This data was encrypted with a different account key'), { code: 'BAD_KEY' }); }
+  return compressed ? zlib.gunzipSync(body) : body;
+}
+const isKeyBlob = b => Buffer.isBuffer(b) && b.length >= 4 && b.subarray(0, 4).equals(KMAGIC);
+const isLegacyBlob = b => Buffer.isBuffer(b) && b.length >= 4 && b.subarray(0, 4).equals(MAGIC);
+
+function wrapKey(dataKey, password) {
+  if (!password) throw Object.assign(new Error('Password is required'), { code: 'NO_PASSWORD' });
+  const salt = crypto.randomBytes(16), iv = crypto.randomBytes(12);
+  const kek = crypto.scryptSync(String(password).normalize('NFC'), salt, 32, SCRYPT);
+  const c = crypto.createCipheriv('aes-256-gcm', kek, iv);
+  c.setAAD(WMAGIC);
+  const ct = Buffer.concat([c.update(dataKey), c.final()]);
+  return Buffer.concat([WMAGIC, salt, iv, c.getAuthTag(), ct]).toString('base64');
+}
+function unwrapKey(wrapped, password) {
+  const b = Buffer.from(String(wrapped || ''), 'base64');
+  if (b.length < 48 + 32 || !b.subarray(0, 4).equals(WMAGIC)) throw Object.assign(new Error('Bad wrapped key'), { code: 'BAD_BLOB' });
+  const salt = b.subarray(4, 20), iv = b.subarray(20, 32), tag = b.subarray(32, 48), ct = b.subarray(48);
+  const kek = crypto.scryptSync(String(password || '').normalize('NFC'), salt, 32, SCRYPT);
+  const d = crypto.createDecipheriv('aes-256-gcm', kek, iv);
+  d.setAAD(WMAGIC); d.setAuthTag(tag);
+  try { return Buffer.concat([d.update(ct), d.final()]); } catch (_) { throw Object.assign(new Error('The password does not unlock this account key'), { code: 'BAD_PASSWORD' }); }
+}
+
+/** x25519 hand-over of the data key to a PC that only knows the (new) password after a reset. */
+function makeKeyRequestPair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
+  return { pub: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'), priv: privateKey };
+}
+function _shared(privateKey, pubB64) {
+  const pub = crypto.createPublicKey({ key: Buffer.from(pubB64, 'base64'), type: 'spki', format: 'der' });
+  return crypto.createHash('sha256').update(crypto.diffieHellman({ privateKey, publicKey: pub })).digest();
+}
+function sealKeyFor(requestPubB64, dataKey) {
+  const eph = crypto.generateKeyPairSync('x25519');
+  const box = encryptWithKey(dataKey, _shared(eph.privateKey, requestPubB64), { compress: false }).toString('base64');
+  return { box, pub: eph.publicKey.export({ type: 'spki', format: 'der' }).toString('base64') };
+}
+function openSealedKey(privateKey, responsePubB64, boxB64) { return decryptWithKey(Buffer.from(boxB64, 'base64'), _shared(privateKey, responsePubB64)); }
+
+module.exports = { newDataKey, keyId, encryptWithKey, decryptWithKey, isKeyBlob, isLegacyBlob, wrapKey, unwrapKey, makeKeyRequestPair, sealKeyFor, openSealedKey, KMAGIC,
+  deriveKey, encryptBuffer, decryptBuffer, encryptJson, decryptJson, encryptString, decryptString, canonical, sha256, storageStateHash, makeVerifier, checkVerifier, MAGIC };

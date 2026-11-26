@@ -95,7 +95,7 @@ class GoogleAuth {
     const res = await this.fetch(this.ep.token, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if (j.error === 'invalid_grant') { this.secrets.delete(this.secretKey); throw Object.assign(new Error('Google Drive access was revoked or expired — connect again in Settings → Cloud'), { code: 'DRIVE_NOT_CONNECTED' }); }
+      if (j.error === 'invalid_grant') { this.secrets.delete(this.secretKey); throw Object.assign(new Error('Google Drive access was revoked or expired — connect again in Settings → Cloud'), { code: 'DRIVE_NOT_CONNECTED', revoked: true }); }
       throw new Error(`Google token refresh failed: ${j.error || res.status}`);
     }
     this._access = { token: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 - 60000 };

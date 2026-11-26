@@ -48,6 +48,7 @@ class MemoryServer {
       if (Object.keys(next).length > 64 && coll !== 'plans') throw new CloudError('permission-denied', 'Too many fields');
       if (coll === 'videos' && !['queued', 'writing', 'uploading', 'done', 'failed', 'skipped'].includes(next.status)) throw new CloudError('permission-denied', `Bad video status ${next.status}`);
     }
+    if (coll === 'meta' && seg[3] === 'activePc' && (typeof next.pcId !== 'string' || next.renewedAt !== now)) throw new CloudError('permission-denied', 'activePc must carry pcId and renewedAt=serverTimestamp');
     if (coll === 'activity' && (typeof next.message !== 'string' || next.message.length > 1000)) throw new CloudError('permission-denied', 'Bad activity');
   }
 
@@ -112,6 +113,8 @@ class MemoryStore {
       async signUp(email, password) { await server.delay(); email = String(email).toLowerCase(); if (server.users.has(email)) throw new CloudError('auth/email-already-in-use', 'Email already in use'); if (String(password).length < 6) throw new CloudError('auth/weak-password', 'Password should be at least 6 characters'); const uid = crypto.randomBytes(14).toString('hex'); server.users.set(email, { uid, password }); self._setUser(uid, email); return self.auth.user(); },
       async signIn(email, password) { await server.delay(); email = String(email).toLowerCase(); const u = server.users.get(email); if (!u || u.password !== password) throw new CloudError('auth/invalid-credential', 'Wrong email or password'); self._setUser(u.uid, email); return self.auth.user(); },
       async signOut() { self._setUser(null, null); },
+      async changePassword(oldPw, newPw) { await server.delay(); const u = server.users.get(self._email); if (!u || u.password !== oldPw) throw new CloudError('auth/invalid-credential', 'Wrong current password'); if (String(newPw).length < 6) throw new CloudError('auth/weak-password', 'Password should be at least 6 characters'); u.password = newPw; },
+      async sendPasswordReset(email) { await server.delay(); server.resetEmails = (server.resetEmails || []).concat(String(email).toLowerCase()); },
       user() { return self._uid ? { uid: self._uid, email: self._email } : null; },
       onChange(cb) { self._authCbs.add(cb); setImmediate(() => cb(self.auth.user())); return () => self._authCbs.delete(cb); },
       async ready() { return self.auth.user(); },

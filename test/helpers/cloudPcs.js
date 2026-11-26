@@ -20,6 +20,17 @@ function fakeLauncher(calls = []) {
     ctx.pages = () => [page]; ctx.newPage = async () => page;
     ctx.storageState = async () => JSON.parse(JSON.stringify(profileStates.get(userDataDir) || { cookies: [], origins: [] }));
     ctx.setStorageState = async s => { calls.push({ op: 'setStorageState', dir: userDataDir }); profileStates.set(userDataDir, JSON.parse(JSON.stringify(s))); };
+    ctx.addCookies = async list => {
+      calls.push({ op: 'addCookies', dir: userDataDir, n: list.length });
+      const st = profileStates.get(userDataDir) || { cookies: [], origins: [] };
+      for (const c of list) {
+        const domain = c.domain || new URL(c.url).hostname;
+        st.cookies = st.cookies.filter(x => !(x.name === c.name && x.domain === domain));
+        st.cookies.push({ name: c.name, value: c.value, domain, path: c.path || '/', expires: c.expires ?? -1, httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || 'Lax' });
+      }
+      profileStates.set(userDataDir, st);
+    };
+    ctx.clearCookies = async () => { const st = profileStates.get(userDataDir); if (st) st.cookies = []; };
     ctx.route = async () => {};
     ctx.cookies = async () => (profileStates.get(userDataDir) || { cookies: [] }).cookies;
     ctx.close = async () => { closed = true; ctx.emit('close'); };
@@ -31,14 +42,15 @@ function fakeLauncher(calls = []) {
 /**
  * @returns {Promise<{app, name, uploads, calls}>}
  */
-async function makePc(server, drive, name, { email = 'owner@example.com', password = 'secret-pass', create = false, settings = {}, uploadMs = 50, uploads = [], passphrase = 'shared-sync-pass', driveConnected = true } = {}) {
+async function makePc(server, drive, name, { email = 'owner@example.com', password = 'secret-pass', create = false, settings = {}, uploadMs = 50, uploads = [], driveConnected = true, singleActive = false, dataDir = null, activeOpts = {}, signIn = true } = {}) {
   const calls = [];
   const app = new UploadPilotApp({
-    dataDir: tmpDir(`pc-${name}-`), startApi: false, launcher: fakeLauncher(calls),
+    dataDir: dataDir || tmpDir(`pc-${name}-`), startApi: false, launcher: fakeLauncher(calls),
     proxyChecker: async () => ({ ok: true, ip: '198.51.100.7', ms: 5 }),
     settings: {
       autopilotPaused: true, uploadWindow: { start: '00:00', end: '24:00' }, geminiLowRes: { enabled: false },
-      cloud: { mode: 'auto', firebaseConfig: JSON.stringify(FAKE_FB), pcName: name, backup: { enabled: false, idleHours: { start: '00:00', end: '00:00' }, speedCapKBps: 0, speedCapPct: 30, chunkMB: 1, deleteAfterUpload: true }, takeoverGraceMin: 120, leaseTtlSec: 120, leaseRenewSec: 30, writeBudget: 18000 },
+      cloud: { mode: 'auto', firebaseConfig: JSON.stringify(FAKE_FB), pcName: name, backup: { enabled: false, idleHours: { start: '00:00', end: '00:00' }, speedCapKBps: 0, speedCapPct: 30, chunkMB: 1, deleteAfterUpload: true }, takeoverGraceMin: 120, leaseTtlSec: 120, leaseRenewSec: 30, writeBudget: 18000, singleActivePc: singleActive, verifyAfterRestore: false },
+      keepAlive: { enabled: false },
       ...settings,
     },
     engineOpts: {
@@ -53,14 +65,14 @@ async function makePc(server, drive, name, { email = 'owner@example.com', passwo
       storeFactory: () => new MemoryStore(server, { name }),
       driveBaseUrl: drive && drive.base, googleEndpoints: drive && drive.endpoints,
       leaseOpts: { renewMs: 100 }, syncOpts: { pushMs: 80, activityFlushMs: 150 }, backupOpts: { tickMs: 3600e3 },
+      activeOpts: { heartbeatMs: 150, staleMs: 1500, handoverTimeoutMs: 6000, handoverWaitMs: 3000, backupBudgetMs: 5000, ...activeOpts },
     },
   });
   await app.start({ api: false });
   await app.cloudReady;
-  await app.cloud.signIn(email, password, { create });
-  if (driveConnected && drive) app.cloud.secrets.set('googleDrive', { refresh_token: drive.tokens.refresh, email: 'tester@example.com' });
-  if (passphrase) await app.cloud.setPassphrase(passphrase);
-  return { app, name, uploads, calls };
+  if (signIn) await app.cloud.signIn(email, password, { create });
+  if (signIn && driveConnected && drive && !app.cloud.googleAuth().connected) { app.cloud.secrets.set('googleDrive', { refresh_token: drive.tokens.refresh, email: 'tester@example.com' }); app.cloud._gauth = null; if (app.cloud.account) await app.cloud.account.publishDrive(); }
+  return { app, name, uploads, calls, dataDir: app.dataDir };
 }
 
 /** A linked channel on this PC: proxy + profile + channel + folder with video files. */

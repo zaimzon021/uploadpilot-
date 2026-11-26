@@ -1,10 +1,17 @@
-# UploadPilot v0.3.0 (cloud sync across PCs + low-load)
+# UploadPilot v0.3.1 (sign in once, one active PC, autosave + retries)
 
 Windows desktop app (Electron) that uploads videos to many YouTube channels on its own, through **YouTube Studio**. Each channel runs in its own real, isolated Chromium profile (its own data folder, cookies and storage), behind its own SOCKS5 proxy. There is **no fingerprint spoofing**.
 
 You link a channel once (sign in by hand, pick a style, pick a folder). After that, autopilot scans the folder, plans 2 uploads per day inside the upload window, has Gemini watch each video and write the title, description and tags, then uploads in up to 3 lanes running side by side. If a channel needs you (login expired, verification, captcha), that channel pauses and the other channels keep going.
 
 **New in 0.3:** sign in once and every PC shares the same channels, plans and queue (Firestore), with leases so a video is never uploaded twice and a browser profile is open on only one PC. Logins move between PCs as an encrypted Playwright storageState. Optional Google Drive backup lets another PC take over a job if its PC dies. Gemini gets a small 360p copy. Without signing in ("Use offline") the app works exactly like 0.2.
+
+**New in 0.3.1:**
+* **Install, then sign in.** The first screen is the UploadPilot sign-in (email + password, or **Create account**). There is no separate sync passphrase any more: a random account data key is wrapped with your password (`meta/keys`), so signing in on a new PC unlocks the saved logins, proxy passwords and keys. **Forgot password?** sends a reset e-mail; after a reset, any PC that is still signed in unlocks the new one (**Ask my other PC**). A 0.3.0 passphrase can be entered once (**Needs you → old passphrase**) so data written by 0.3.0 stays readable.
+* **Connect Google Drive once for the whole account.** The Drive connection, settings, Gemini keys and the proxy pool follow the account (encrypted with the data key), so a second PC needs nothing set up. Per-PC values (PC name, lanes, API port, browser path, pause switch) stay on each PC.
+* **One active PC, with take-over.** Only one PC per account runs autopilot (it holds `meta/activePc`, renewed every ~30 s by server time). Signing in on another PC shows **"UploadPilot is active on PC-x — Take over?"**. The old PC finishes or stops its current upload, saves its logins, backs up, releases its leases and signs out; the new PC then becomes active. If the old PC is dead or offline (no heartbeat for ~2 min), the take-over happens without it. The dashboard shows **Active on: PC-x**.
+* **Google sign-in fix (DBSC).** Chromium on Windows now binds a Google login to the PC's TPM ("Device Bound Session Credentials"), so a login copied to another PC signed out within minutes. These features are now switched off for every profile. **After updating, every existing profile needs one fresh Google sign-in** (Open profile → sign in to Google → Resume). After that the login moves between PCs normally. A daily keep-alive visit to youtube.com keeps unused profiles' cookies fresh.
+* **Autosave and automatic retries.** Settings and channel fields save themselves as you type (no Save buttons; "Saved ✓" appears next to the field). Gemini writes the title, description and tags as soon as a video is found; a video is never uploaded without them (after 5 min without AI it gets a clean title from its file name). A failed upload is retried automatically up to 3 times (after ~5, 15, 45 min, inside the upload window only); **Needs you** lists what only you can fix, with a button for each.
 
 ---
 
@@ -25,10 +32,10 @@ The Desktop client ID is built in; its **client secret is never in the repo**. G
 The consent screen is in **Testing**: only listed test users (zaimiftikhar0786@gmail.com, zaimbreakthrough2@gmail.com) can connect, and Google expires test-mode refresh tokens after **7 days**. Then you reconnect, or publish the consent screen to remove that limit. **Connect Google Drive** opens the system browser with an account chooser (`prompt=select_account`): pick the account whose Drive should hold backups (e.g. the 5 TB one). It can be a different account from the UploadPilot sign-in.
 
 ### 3. On every PC
-1. Sign in (or **Create account** on the first PC) with the same email/password.
-2. Settings → Cloud: set **the same sync passphrase** on every PC (min 8 chars; a second PC is checked against the first). It encrypts profile logins and proxy passwords. If you lose it, those can't be read; you'd sign the profiles in again.
-3. Give each PC a name (shown as "running on …").
-4. Connect Google Drive (needed for login sync and backups).
+1. Install and start UploadPilot, then **sign in** with the same email/password (**Create account** on the first PC). Or pick **Work offline on this PC** (works like 0.2, no sync).
+2. On the first PC only: **Connect Google Drive** once (Settings → Cloud). The connection then follows the account to every PC (needed for login sync and backups).
+3. Optionally rename the PC (shown as "Active on …" / "running on …").
+4. A second PC that signs in while another is active offers **Take over**. 
 
 ### Using your own Firebase project instead
 Create a project → enable **Authentication › Email/Password** → create **Firestore** → publish `firestore.rules` → **Project settings › Your apps › Web app** → paste its `firebaseConfig` in Settings → Cloud (or save `{ "firebase": {...}, "google": {"clientId": "...", "clientSecret": "..."} }` as `<data>/cloud-config.json`). For Drive: Google Cloud console → enable **Google Drive API** → OAuth consent screen (External, Testing, add test users, scope `drive.file`) → Credentials → **OAuth client ID › Desktop app**.
@@ -100,11 +107,11 @@ Failure handling:
 * Logs: `<data>/logs/app-YYYY-MM-DD.log`, plus one folder per run, `<data>/logs/runs/<date>/run-00042-ch7/`, holding `run.log` and numbered screenshots.
 
 ### Cloud sync (0.3)
-* **Workspace = your Firebase uid.** Everything lives under `users/{uid}/…`: `channels`, `profiles` (number, name, proxy host/port/user + **encrypted** password, login snapshot version/hash/Drive file id), `videos` (`status` queued/writing/uploading/done/failed/skipped, `detail` = local status, title/description/tags/hashtags, scheduled time, YouTube URL, `driveFileId`, origin PC), `plans/{channel}` (next 10 slots), `activity` (important events only), `pcs`, `leases`, `meta/sync` (passphrase verifier). The rules allow only the owner, require `updatedAt = server time` and check lease rules.
+* **Workspace = your Firebase uid.** Everything lives under `users/{uid}/…`: `channels`, `profiles` (number, name, proxy host/port/user + **encrypted** password, login snapshot version/hash/Drive file id), `videos` (`status` queued/writing/uploading/done/failed/skipped, `detail` = local status, title/description/tags/hashtags, scheduled time, YouTube URL, `driveFileId`, origin PC), `plans/{channel}` (next 10 slots), `activity` (important events only), `pcs`, `leases`, `meta/keys` (wrapped data key), `meta/activePc` + `meta/takeover` (active PC), `meta/settings` + `meta/drive` (encrypted account settings and Drive connection). The rules allow only the owner, require `updatedAt = server time` and check lease rules.
 * **Local SQLite stays the cache and offline queue.** Triggers mark edited rows dirty; every 2 s the dirty rows are diffed against the last synced copy and only changed fields are written, merged, in batches. Remote changes arrive through `onSnapshot` listeners (no polling) and are applied field by field. A field this PC changed but hasn't pushed yet wins. Nothing echoes back.
 * **Files stay where they are.** A channel's folder belongs to one PC. Other PCs see its videos as cloud copies (`cloud:<id>`). Planning and Gemini run only on the PC that has the file, and so does the YouTube upload. Another PC **takes over** a job only when (a) the owner's job lease expired mid-upload (the PC died) or (b) the video is overdue by `takeoverGraceMin` (default 120 min), **and** a Drive backup exists. It downloads the backup into `<data>/cache`, uploads it, and deletes the cache file afterwards. The owner then moves its file to `Done/`.
 * **Leases** (`users/{uid}/leases/{video_<id>|profile_<id>}` = `{pcId, pcName, renewedAt: serverTimestamp, ttlSec: 120, expiresAt, released}`): claimed in a transaction before an upload and before any profile opens; renewed every 30 s; released when done. Others skip a held job/profile ("running on PC-x"). After ~2 min without renewal another PC may take over. Expiry is checked against **server time** by the rules (`request.time > renewedAt + ttl`), so a PC with a wrong clock can't steal a live lease. If a PC that lost its lease comes back, its next renewal is refused and its upload stops.
-* **Profile logins** move as Playwright `storageState({indexedDB:true})`: cookies + localStorage + IndexedDB, **not** a raw folder copy (Windows DPAPI makes copied cookies useless). On close (and every 3 min for hand-used windows) the state is hashed. Only if it changed is it encrypted (AES-256-GCM, scrypt key from the passphrase) and uploaded to Drive `UploadPilot/profiles/profile-<id>.state`, with `stateVersion`++. A PC with an older or missing version downloads and imports it (`context.setStorageState`) **before the first navigation**.
+* **Profile logins** move as Playwright `storageState({indexedDB:true})`: cookies + localStorage + IndexedDB, **not** a raw folder copy (Windows DPAPI makes copied cookies useless). On close (and every 3 min for hand-used windows) the state is hashed. Only if it changed is it encrypted (AES-256-GCM with the account data key) and uploaded to Drive `UploadPilot/profiles/profile-<id>.state`, with `stateVersion`++. A PC with an older or missing version downloads and imports it (`context.setStorageState`) **before the first navigation**.
 * **Drive backup** (optional, off by default): `UploadPilot/channels/<channel>/<file>`. Resumable 8 MB chunks, speed cap (user KB/s, else 30% of the speed measured on the first chunk), only inside the idle-hours window (default 01:00–07:00, may wrap midnight), and never while this PC uploads to YouTube: the chunk in flight is aborted and resumed later from the server offset. Back-off on 403 `userRateLimitExceeded`/429/5xx; daily-limit errors pause it for the day; a local counter stops at 700 GB/day (Drive's limit is ~750 GB). By default the backup is deleted once the video is published (`backup.deleteAfterUpload`).
 * **Quota (Spark: 50k reads / 20k writes a day):** no heartbeats except lease renewals (2 writes/min per running upload). Video progress rides on the lease renewal. Diffed and batched writes. Activity is batched every 15 s, important kinds only, max 1500/day. Videos are listened to with two narrow queries (unfinished + changed in the last 36 h). Above `writeBudget` (18k) activity/plan docs pause. Settings → Cloud shows today's reads and writes. A rough guide: 100 channels × 2 uploads/day ≈ 3–5k writes/day. Each app start re-reads the active docs (no persistent Firestore cache in Node).
 * **Offline:** if Firestore can't be reached, this PC still uploads **its own** files without a lease (logged) and syncs later. It never takes over another PC's file without the cloud.
@@ -131,7 +138,7 @@ npm run test:emulator       # Firestore + Auth emulators with the real rules (ne
 ```
 The Windows installer ships its own Chromium (Playwright's build matching playwright-core), so no Chrome install is needed. For a dev checkout run `npm run browsers:install` once.
 
-Building: `npm run build` builds `dist/UploadPilot Setup 0.3.0.exe` (NSIS, x64, per-user, lets you pick the install folder, desktop shortcut). Run it on Windows (or x64 Linux). `npm run build:win-dir` makes `dist/win-unpacked/UploadPilot.exe` without NSIS.
+Building: `npm run build` builds `dist/UploadPilot Setup 0.3.1.exe` (NSIS, x64, per-user, lets you pick the install folder, desktop shortcut). Run it on Windows (or x64 Linux). `npm run build:win-dir` makes `dist/win-unpacked/UploadPilot.exe` without NSIS.
 
 ---
 
@@ -181,10 +188,15 @@ Security: the Host header must be loopback (blocks DNS rebinding). A request car
 | POST | `/settings/gemini/test` | `{keys?: "text"}` (saved first when given) | `{keys:[{key:'…abcd', ok, error?}], models[], model, modelOk, suggested, flashModels[]}` — each key tested on its own |
 | GET | `/scheduler` | | lanes, live runs |
 | POST | `/autopilot/pause` \| `/autopilot/resume` | | `{paused}` |
-| GET | `/cloud/status` | | state (unconfigured/signed_out/offline/connecting/online), user, PC, passphrase/Drive/backup/sync/quota/leases |
+| GET | `/cloud/status` | | state (unconfigured/signed_out/offline/connecting/online), user, PC, active PC, key/Drive/backup/sync/quota/leases |
 | POST | `/cloud/signin` | `{email, password, create?}` | status |
 | POST | `/cloud/signout` \| `/cloud/offline` \| `/cloud/reconnect` | | status |
-| POST | `/cloud/passphrase` | `{passphrase, force?}` | `{set}` (409 if it differs from the other PCs' one) |
+| POST | `/cloud/legacy-passphrase` (alias `/cloud/passphrase`) | `{passphrase}` | migrates a 0.3.0 sync passphrase into the account key |
+| POST | `/cloud/unlock` \| `/cloud/start-fresh` | `{password}` | unlock the data key after a password change/reset, or start a new key |
+| POST | `/cloud/key-request` | | asks a signed-in PC to unlock this one |
+| POST | `/cloud/password` | `{oldPassword, newPassword}` | change the account password (re-wraps the data key) |
+| POST | `/cloud/forgot` | `{email}` | sends the Firebase reset e-mail |
+| POST | `/cloud/takeover` | | makes this PC the active one (graceful hand-over) |
 | POST | `/cloud/drive/connect` \| `/cloud/drive/disconnect` | | `{url}` (opens the system browser) |
 | POST | `/cloud/backup/run` | | runs one backup step now |
 
@@ -193,9 +205,9 @@ Example: `curl -s -XPOST localhost:53300/api/v1/profiles/3/open` returns `data.w
 ---
 
 ## Settings (defaults)
-videosPerDay 2 · uploadWindow 09:00–23:00 · lanes 3 · delayRangeMin 1–7 · geminiModel `gemini-3.5-flash-lite` (use "Test keys / list models" to confirm the exact name your key offers) · upload.stepTimeoutMs 60 000 · upload.channelHardLimitMs 1 200 000 · upload.maxRetries 3 · typing per char 35–160 ms for the first 350 chars, then quick chunks · browser.windowMode minimized · apiPort 53300.
+videosPerDay 2 · uploadWindow 09:00–23:00 · lanes 3 · delayRangeMin 1–7 · geminiModel `gemini-3.5-flash-lite` (use "Test keys / list models" to confirm the exact name your key offers) · upload.stepTimeoutMs 60 000 · upload.channelHardLimitMs 1 200 000 · upload.maxRetries 3 · retry {max 3, backoff 5/15/45 min, ±20%} · aiWriteAhead true · keepAlive {on, profiles unused 24 h, 20 s visit} · typing per char 35–160 ms for the first 350 chars, then quick chunks · browser.windowMode minimized · apiPort 53300.
 
-Cloud: `cloud.backup` {enabled false, speedCapKBps 0 (=30% of measured), idleHours 01:00–07:00, chunkMB 8, deleteAfterUpload true} · takeoverGraceMin 120 · leaseTtlSec 120 / leaseRenewSec 30 · writeBudget 18000 · pauseWhenActive {false, 5 min} · geminiLowRes {true, 360p, 300 kbps} · browser.blockMedia false · logRetentionDays 14.
+Cloud: `cloud.backup` {enabled false, speedCapKBps 0 (=30% of measured), idleHours 01:00–07:00, chunkMB 8, deleteAfterUpload true} · takeoverGraceMin 120 · singleActivePc true · leaseTtlSec 120 / leaseRenewSec 30 · writeBudget 18000 · pauseWhenActive {false, 5 min} · geminiLowRes {true, 360p, 300 kbps} · browser.blockMedia false · logRetentionDays 14.
 
 ## Known gaps / risks
 See TESTING.md → "Needs live verification".

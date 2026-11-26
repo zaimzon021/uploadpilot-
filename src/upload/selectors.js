@@ -48,6 +48,12 @@ module.exports = {
     url: ['ytcp-video-share-dialog #share-url', 'ytcp-video-share-dialog a[href*="youtu"]', 'ytcp-uploads-still-processing-dialog a[href*="youtu"]'],
     close: ['ytcp-video-share-dialog #close-button', 'ytcp-uploads-still-processing-dialog #close-button', 'ytcp-uploads-still-processing-dialog ytcp-button:has-text("Close")', '#close-button'],
   },
+  // Content list (Studio → Content → Videos) used for the duplicate check before a retry. NOT verified live.
+  content: {
+    row: ['ytcp-video-row', '#row-container.ytcp-video-row'],
+    title: ['#video-title', 'a#video-title', '.video-title-wrapper #video-title'],
+    link: ['a#video-title', 'a[href*="/video/"]', '#thumbnail-anchor'],
+  },
   // generic dialogs we may need to dismiss during recovery
   dismiss: ['ytcp-dialog #close-button', 'tp-yt-paper-dialog #close-button', 'ytcp-button:has-text("Close")', 'ytcp-button:has-text("Got it")', 'ytcp-button:has-text("Dismiss")', 'button:has-text("OK")', 'button:has-text("Got it")', 'button:has-text("No thanks")', 'button:has-text("Not now")', 'ytcp-button:has-text("Continue")', '[aria-label="Close"]'],
   google: {
@@ -63,6 +69,7 @@ module.exports = {
     noChannel: ['create channel', 'choose how to create your channel', 'create a channel'],
     doneDialog: ['video published', 'video processing', 'video saved', 'video uploaded', 'video scheduled', 'still processing', 'processing will begin', 'video link', 'share video', 'upload complete'],
     uploadComplete: ['upload complete', 'processing', 'checks complete', 'processed', 'finished processing', 'no issues found', 'video uploaded'],
+    draft: ['draft', 'edit draft', 'upload incomplete', 'processing abandoned'],
     uploadFailed: ['upload failed', 'processing abandoned', 'upload canceled', 'upload cancelled', 'file is too large', 'invalid file format', 'duplicate upload'],
   },
 };

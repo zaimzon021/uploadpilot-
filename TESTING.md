@@ -1,4 +1,42 @@
-# TESTING — UploadPilot v0.3.0
+# TESTING — UploadPilot v0.3.1
+
+## v0.3.1 results (2026-11-26)
+
+Same sandbox (Linux arm64, Node 22.23, playwright-core 1.65 + Chromium 1255, Firebase emulators on Java 21). Each test file was run on its own (2-minute command cap). **No real Google/Firebase/Drive sign-in was made.**
+
+| Suite | File | Tests | Pass |
+|---|---|---|---|
+| Unit, 0.3.0 suites | `test/unit/*` (13 files) | 68 | 68 |
+| Account: data key wrap/unwrap, change password, forgot password (x25519 key hand-over from another PC, or start fresh), 0.3.0 passphrase migration, a new PC that **only signs in** gets settings, keys, proxies, **Drive** and logins; Drive revoked on one PC drops everywhere | `v031-account.test.js` | 6 | 6 |
+| Active PC: graceful **take-over** (old PC finishes its upload, saves logins, backs up, releases leases, signs out), dead PC (stale heartbeat), a stale PC coming back never overwrites newer logins; keep-alive visits | `v031-active-pc.test.js` | 4 | 4 |
+| Autopilot: repro of the "uploading null" crash, inline metadata before upload, AI writes ahead + rate limit, **autosave** (only changed fields), **automatic retries** (5/15/45 min, 3 attempts, needs-you not retried), scheduler wake | `v031-autopilot.test.js` | 9 | 9 |
+| **Unit total** (`npm test`) | | **87** | **87** |
+| E2E: api, upload-engine, failures, socks-bridge, autopilot, profile-state (incl. 0.3.1: login import before first navigation, DBSC features off) | `test/e2e/*` | 33 | 33 |
+| Full journey: PC1 install → create account → Drive → link → AI → publish; PC2 sign in only → everything arrives → take over → publishes with the restored login | `journey.test.js` | 2 | 2 |
+| **Channels table**: real renderer + its CSP in Chromium; Open profile / Stop don't open the channel page, rest of the row does, no CSP violations | `renderer-channels.test.js` | 1 | 1 |
+| **E2E total** | | **36** | **36** |
+| Firebase Emulator (real SDK + real rules), incl. `meta/activePc` rule, account key, restart signs in again with no password | `firestore-emulator.test.js` | 3 | 3 |
+
+**Total: 126 automated tests, all passing.**
+
+Bugs found and fixed in 0.3.1:
+* Channels table: the CSP (`script-src 'self'`) blocked the inline `onclick="event.stopPropagation()"`, so Open profile / Stop also opened the channel page. Now a real listener (and the row ignores clicks on its buttons).
+* A row Save sent empty description/tags, the AI worker treated it as edited and marked the video ready with no title → upload crashed on `title.replace`. Uploads now always have metadata.
+* A cached Gemini client property shadowed the `_gemini()` method, so every AI job fell back to file-name titles.
+* Videos dropped into a freshly linked empty folder in the first second were missed (watcher now rescans once when ready).
+* After typing in Settings, clicking a channel did nothing for 4 s.
+
+Known flaky: `cloud-multi-pc.test.js` › "lease expiry" failed once ("the scheduler would pick the channel") while the Firebase emulator was also running; it passed 7 runs in a row afterwards. When it fails, the file does not exit (timers from the aborted test keep it alive).
+
+### v0.3.1 — needs live verification
+1. **DBSC**: existing profiles need **one fresh Google sign-in** after this update (logins saved by 0.3.0 were bound to the old PC's TPM). Check on Windows that a login moved to a second PC stays signed in for days.
+2. Take-over between two real Windows PCs against production Firestore (rules must be re-published: `meta/activePc` rule changed).
+3. Forgot-password flow with a real Firebase reset e-mail, then **Ask my other PC**.
+4. Keep-alive visits on real profiles (cookies refreshed, no Google security prompts).
+
+---
+
+# v0.3.0 test notes
 
 ## v0.3.0 results (2026-11-26)
 

@@ -63,6 +63,8 @@ class FirestoreStore {
       signOut: async () => { await fa.signOut(A); },
       user: u,
       onChange: cb => fa.onAuthStateChanged(A, () => cb(u())),
+      changePassword: async (oldPw, newPw) => { try { const cu = A.currentUser; if (!cu) throw new Error('Not signed in'); await fa.reauthenticateWithCredential(cu, fa.EmailAuthProvider.credential(cu.email, oldPw)); await fa.updatePassword(cu, newPw); } catch (e) { throw mapErr(e); } },
+      sendPasswordReset: async email => { try { await fa.sendPasswordResetEmail(A, email); } catch (e) { throw mapErr(e); } },
       ready: async () => { await A.authStateReady(); return u(); },
     };
   }

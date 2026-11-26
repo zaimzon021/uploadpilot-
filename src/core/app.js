@@ -14,11 +14,26 @@ const { LaneScheduler } = require('../autopilot/laneScheduler');
 const { GeminiClient } = require('../ai/gemini');
 const { ChannelRunner } = require('../upload/channelRunner');
 const { LinkWizard, normalizeStyle } = require('../wizard/linkWizard');
-const { startOfDay, addDays, inWindow, dayKey } = require('../util/time');
+const { startOfDay, addDays, inWindow, dayKey, nextInWindow } = require('../util/time');
 const { proxyLabel } = require('../proxy/parse');
 const { CloudService } = require('../cloud');
 const { makeLowRes } = require('../ai/lowres');
 const { rotateLogs } = require('../util/logRotate');
+const { missingFields, isComplete, fallbackMeta } = require('../upload/metadata');
+const { KeepAlive } = require('../profiles/keepAlive');
+const { gotoLanding } = require('../profiles/profileManager');
+const { googleAuthCookies } = require('../cloud/profileState');
+
+/** Short, plain reason for the activity feed. */
+function humanizeError(msg) {
+  const m = String(msg || '');
+  if (/Step timeout/i.test(m)) return 'Studio stopped responding';
+  if (/Hard limit/i.test(m)) return 'the run took too long';
+  if (/net::ERR_(PROXY|SOCKS|TUNNEL)/i.test(m)) return 'proxy connection failed';
+  if (/net::ERR_/i.test(m)) return 'network error';
+  if (/Target (page, context or browser )?closed|browser has been closed/i.test(m)) return 'the browser closed';
+  return m.replace(/^(Error: )?/, '').slice(0, 160);
+}
 
 class UploadPilotApp {
   /**
@@ -45,7 +60,8 @@ class UploadPilotApp {
     this.events = new Events(this.db, this.logsDir);
     this.profiles = new ProfileManager({ db: this.db, settings: this.settings, events: this.events, dataDir: this.dataDir, launcher: o.launcher, proxyChecker: o.proxyChecker });
     this.cloud = new CloudService({ app: this, safeStorage: o.safeStorage, openExternal: o.openExternal, resourcesPath: o.resourcesPath, ...(o.cloud || {}) });
-    this.runner = new ChannelRunner({ db: this.db, settings: this.settings, events: this.events, profiles: this.profiles, logsDir: this.logsDir, engineOpts: o.engineOpts || {}, cloud: this.cloud });
+    this.runner = new ChannelRunner({ db: this.db, settings: this.settings, events: this.events, profiles: this.profiles, logsDir: this.logsDir, engineOpts: o.engineOpts || {}, cloud: this.cloud,
+      ensureMeta: (v, ctx) => this.ensureMetadata(v, ctx), onFailure: (v, err, ctx) => this.failUpload(v, err, ctx) });
     this.profiles.hooks = {
       beforeOpen: (prof, purpose) => this.cloud.beforeOpenProfile(prof, purpose),
       afterLaunch: (prof, sess) => this.cloud.afterLaunchProfile(prof, sess),
@@ -54,7 +70,8 @@ class UploadPilotApp {
     };
     this.wizard = new LinkWizard(this);
     this.watchers = new Map();
-    this.aiBusy = new Set(); this.aiNextTry = new Map();
+    this.aiBusy = new Set(); this.aiNextTry = new Map(); this.aiJobs = new Map(); this._aiLastStart = 0;
+    this.keepAlive = new KeepAlive({ app: this, ...(o.keepAliveOpts || {}) });
     this.started = false;
   }
 
@@ -81,11 +98,12 @@ class UploadPilotApp {
     this._buildScheduler();
     if (!this.settings.get('autopilotPaused')) this.scheduler.start();
     this._aiTimer = setInterval(() => this.aiTick().catch(e => this.events.error(`AI worker: ${e.message}`)), this.settings.get('aiTickMs'));
+    this.keepAlive.start();
     this._planTimer = setInterval(() => this.replanAll(), 15 * 60000);
     setTimeout(() => this.aiTick().catch(() => {}), 500);
     this.events.info(`UploadPilot started (db: ${this.db.driver})`, { kind: 'app' });
     // cloud sign-in / sync starts in the background; the app works locally meanwhile
-    this.cloudReady = this.cloud.start().then(st => { if (this.scheduler) this.scheduler.wake(); return st; })
+    this.cloudReady = this.cloud.start().then(st => { if (this.scheduler) this.scheduler.wake(); this.aiKick(); return st; })
       .catch(e => { this.events.error(`Cloud: ${e.message}`, { kind: 'cloud' }); return this.cloud.status(); });
     this.cloud.on('change', () => this.events.emit('cloud', { ts: Date.now() }));
   }
@@ -109,6 +127,9 @@ class UploadPilotApp {
     try { const m = moveToDone(v.path, v.thumb); this.db.applying(() => this.db.run('UPDATE videos SET path=?, thumb=? WHERE id=?', m.video || v.path, m.thumb || v.thumb, v.id)); this.events.info(`${v.filename} was published by another PC — moved to Done`, { channelId: v.channel_id, kind: 'scan' }); } catch (_) { /* ignore */ }
   }
 
+  /** Is this PC allowed to start work now (active PC, not winding down, user not busy)? */
+  canWork() { return !this.windingDown && !this.userActive() && this.cloud.mayRun(); }
+
   _buildScheduler() {
     const s = this.settings.all();
     this.scheduler = new LaneScheduler({
@@ -118,7 +139,8 @@ class UploadPilotApp {
       cooldownMs: this.o.cooldownMs ?? 10 * 60000,
       getAllChannels: () => this.db.all(`SELECT id FROM channels WHERE status='active'`).map(r => r.id),
       getDueChannels: () => this.dueChannelIds(),
-      canStart: () => !this.userActive(),
+      canStart: () => this.canWork(),
+      getNextDueAt: () => this.nextDueAt(),
       runChannel: (id, lane) => this.runner.run(id, lane),
       onEvent: ev => { if (ev.type === 'wait') this.events.info(`Lane ${ev.lane + 1}: waiting ${Math.round(ev.ms / 1000)}s before next channel`, { kind: 'lane' }); if (ev.type === 'error') this.events.error(`Lane ${ev.lane + 1}: ${ev.error}`, { channelId: ev.channelId, kind: 'lane' }); },
     });
@@ -131,7 +153,7 @@ class UploadPilotApp {
   }
 
   async stop() {
-    clearInterval(this._aiTimer); clearInterval(this._planTimer); clearInterval(this._rotateTimer);
+    clearInterval(this._aiTimer); clearTimeout(this._aiKickT); this.keepAlive.stop(); clearInterval(this._planTimer); clearInterval(this._rotateTimer);
     if (this.scheduler) await this.scheduler.stop();
     for (const w of this.watchers.values()) await w.close();
     this.watchers.clear();
@@ -148,8 +170,10 @@ class UploadPilotApp {
   dueChannelIds(now = Date.now()) {
     const s = this.settings.all();
     if (s.autopilotPaused || !inWindow(now, s.uploadWindow)) return [];
-    const rows = this.db.all(`SELECT c.id AS cid, c.profile_id, v.* FROM channels c JOIN videos v ON v.channel_id=c.id
-      WHERE c.status='active' AND (c.paused_until IS NULL OR c.paused_until<=?) AND v.status='ready' AND v.scheduled_at<=?`, now, now);
+    const rows = this.db.all(`SELECT c.id AS cid, c.profile_id, c.style AS ch_style, v.* FROM channels c JOIN videos v ON v.channel_id=c.id
+      WHERE c.status='active' AND (c.paused_until IS NULL OR c.paused_until<=?) AND v.scheduled_at<=? AND (v.retry_at IS NULL OR v.retry_at<=?)
+        AND (v.status='ready' OR (v.status='queued' AND v.ai_status!='running'))`, now, now, now)
+      .filter(r => r.status === 'ready' || JSON.parse(r.ch_style || '{}').mode !== 'approval');   // queued (AI not done yet) in auto mode: the runner writes it inline
     const ids = new Set();
     for (const r of rows) {
       if (ids.has(r.cid)) continue;
@@ -160,6 +184,17 @@ class UploadPilotApp {
     }
     return [...ids];
   }
+
+  /** Earliest future moment something becomes due (a slot or a retry), so idle lanes don't over-sleep. */
+  nextDueAt(now = Date.now()) {
+    const r = this.db.get(`SELECT MIN(MAX(v.scheduled_at, COALESCE(v.retry_at, 0))) AS t FROM videos v JOIN channels c ON c.id=v.channel_id
+      WHERE c.status='active' AND v.status IN ('ready','queued') AND v.scheduled_at IS NOT NULL AND MAX(v.scheduled_at, COALESCE(v.retry_at, 0))>?`, now);
+    return r && r.t ? r.t : null;
+  }
+
+  /** A time / status changed (here or on another PC): the scheduler and the AI queue look again now. */
+  onVideosChanged() { if (this.scheduler) this.scheduler.wake(); this.aiKick(); }
+  onBecameActive() { if (this.scheduler) { if (!this.scheduler.running && !this.settings.get('autopilotPaused')) this.scheduler.start(); this.scheduler.wake(); } this.aiKick(); }
 
   /** Scan the channel folder, add new videos, then plan. */
   ingest(channelId) {
@@ -176,6 +211,7 @@ class UploadPilotApp {
     });
     if (added) this.events.info(`${ch.name || 'Channel'}: ${added} new video(s) found`, { channelId, kind: 'scan' });
     this.plan(channelId);
+    if (added) { this.aiKick(); if (this.scheduler) this.scheduler.wake(); }
     return { added, total: files.length };
   }
 
@@ -183,7 +219,7 @@ class UploadPilotApp {
     const ch = this.db.get('SELECT * FROM channels WHERE id=?', channelId);
     let size = 0; try { size = fs.statSync(file).size; } catch (_) { return; }
     const r = this.db.run('INSERT OR IGNORE INTO videos(channel_id,path,thumb,filename,size,status,created_at) VALUES(?,?,?,?,?,?,?)', channelId, file, findThumb(file), path.basename(file), size, 'queued', Date.now());
-    if (r.changes) { this.events.info(`${ch?.name || 'Channel'}: new video ${path.basename(file)} added to the plan`, { channelId, kind: 'scan' }); this.plan(channelId); }
+    if (r.changes) { this.events.info(`${ch?.name || 'Channel'}: new video ${path.basename(file)} added`, { channelId, kind: 'scan' }); this.plan(channelId); this.aiKick(); if (this.scheduler) this.scheduler.wake(); }
   }
 
   watch(channelId) {
@@ -195,6 +231,8 @@ class UploadPilotApp {
       usePolling: !!this.o.watchPolling,               // native OS events; polling only for tests on odd filesystems
       pollInterval: this.o.watchPollInterval ?? 1000,  // awaitWriteFinish size checks of a file still being copied
       onVideo: p => this.addVideoFile(channelId, p),
+      // files dropped while the watcher was still starting are not reported as "add": scan once when it is ready
+      onReady: () => { try { if (this.watchers.has(channelId)) this.ingest(channelId); } catch (_) { /* folder gone */ } },
       onThumb: p => {
         const base = path.basename(p, path.extname(p)).toLowerCase();
         for (const v of this.db.all(`SELECT id, path FROM videos WHERE channel_id=? AND thumb IS NULL AND status NOT IN ('done')`, channelId)) {
@@ -221,63 +259,257 @@ class UploadPilotApp {
     return plan;
   }
 
+  /** Upload window / per-day changed: re-spread future, not-yet-uploaded slots (one channel or all). */
+  replanFuture(channelId = null) {
+    const now = Date.now();
+    if (channelId) this.db.run(`UPDATE videos SET scheduled_at=NULL WHERE channel_id=? AND status IN ('queued','awaiting_approval','ready') AND scheduled_at>? AND retry_at IS NULL`, channelId, now);
+    else this.db.run(`UPDATE videos SET scheduled_at=NULL WHERE status IN ('queued','awaiting_approval','ready') AND scheduled_at>? AND retry_at IS NULL`, now);
+    if (channelId) this.plan(channelId); else this.replanAll();
+    if (this.scheduler) this.scheduler.wake();
+  }
+
   replanAll() { for (const ch of this.db.all(`SELECT id FROM channels WHERE folder IS NOT NULL`)) { try { this.plan(ch.id); } catch (_) {} } }
 
+  /** One Gemini client while keys/model stay the same, so key rotation and 429 cool-downs carry across jobs. */
   geminiClient() {
     const s = this.settings.all();
-    return new GeminiClient({
+    const sig = JSON.stringify([s.geminiKeys, s.geminiModel, s.geminiBaseUrl]);
+    if (this._geminiClient && this._geminiSig === sig) return this._geminiClient;
+    this._geminiSig = sig;
+    return (this._geminiClient = new GeminiClient({
       keys: s.geminiKeys, model: s.geminiModel, baseUrl: s.geminiBaseUrl, fetchImpl: this.o.fetchImpl || globalThis.fetch,
       sleep: this.o.geminiSleep, pollMs: this.o.geminiPollMs ?? 3000,
       log: m => this.events.warn(m, { kind: 'ai' }),
       onUsage: (h, ok) => this.db.run(`INSERT INTO key_usage(key_hash,day,calls,errors) VALUES(?,?,1,?) ON CONFLICT(key_hash,day) DO UPDATE SET calls=calls+1, errors=errors+excluded.errors`, h, dayKey(Date.now()), ok ? 0 : 1),
-    });
+    }));
   }
 
-  /** Generate AI metadata for today's (and lookahead) videos. */
+  /** Start the AI worker soon (debounced): new video, time moved earlier, keys added, … */
+  aiKick(delayMs = 150) {
+    if (!this.started) return;
+    clearTimeout(this._aiKickT);
+    this._aiKickT = setTimeout(() => this.aiTick().catch(e => this.events.error(`AI worker: ${e.message}`, { kind: 'ai' })), delayMs);
+    if (this._aiKickT.unref) this._aiKickT.unref();
+  }
+
+  /**
+   * AI writes ahead: every queued video gets Gemini metadata in the background as soon as it is found,
+   * earliest slot first (a video moved earlier jumps the queue). Rate-limited: aiConcurrency jobs at a
+   * time and at least aiMinGapMs between two starts. aiWriteAhead=false keeps the 0.3.0 rule (today only).
+   */
   async aiTick(now = Date.now()) {
     const s = this.settings.all();
     if (!s.geminiKeys.length) return 0;
-    if (this.userActive()) return 0;
-    const until = startOfDay(addDays(now, 1 + (s.aiLookaheadDays || 0)));
+    if (this.userActive() || this.windingDown || (this.cloud && !this.cloud.mayRun())) return 0;
     const free = (s.aiConcurrency || 2) - this.aiBusy.size;
     if (free <= 0) return 0;
+    const until = s.aiWriteAhead === false ? startOfDay(addDays(now, 1 + (s.aiLookaheadDays || 0))) : Number.MAX_SAFE_INTEGER;
     const rows = this.db.all(`SELECT v.*, c.style, c.name AS channel_name FROM videos v JOIN channels c ON c.id=v.channel_id
-      WHERE v.status='queued' AND v.remote=0 AND v.ai_status IN ('pending','retry') AND v.scheduled_at IS NOT NULL AND v.scheduled_at<? AND c.status IN ('active','paused','needs_you')
-      ORDER BY v.scheduled_at LIMIT ?`, until, 50).filter(v => !this.aiBusy.has(v.id) && !((this.aiNextTry.get(v.id) || 0) > now)).slice(0, free);
+      WHERE v.remote=0 AND v.ai_status IN ('pending','retry') AND c.status IN ('active','paused','needs_you')
+        AND (v.status='queued' OR (v.status='ready' AND (v.title IS NULL OR TRIM(v.title)='' OR v.description IS NULL OR TRIM(v.description)='' OR v.tags IS NULL OR v.tags IN ('','[]'))))
+        AND (v.scheduled_at IS NULL OR v.scheduled_at<?)
+      ORDER BY CASE WHEN v.scheduled_at IS NULL THEN 1 ELSE 0 END, v.scheduled_at, v.id LIMIT 50`, until)
+      .filter(v => !this.aiBusy.has(v.id) && !((this.aiNextTry.get(v.id) || 0) > now));
+    if (!rows.length) return 0;
+    const gap = s.aiMinGapMs ?? 4000;
     const client = this.geminiClient();
-    await Promise.all(rows.map(v => this._aiOne(client, v)));
-    return rows.length;
+    const started = [];
+    for (const v of rows.slice(0, free)) {
+      const wait = this._aiLastStart + gap - Date.now();
+      if (gap > 0 && wait > 0) { this.aiKick(wait + 20); break; }
+      this._aiLastStart = Date.now();
+      started.push(this._aiStart(client, v));
+      if (gap > 0) { if (rows.length > started.length) this.aiKick(gap + 20); break; }
+    }
+    await Promise.all(started);
+    return started.length;
   }
 
-  async _aiOne(client, v) {
-    this.aiBusy.add(v.id);
-    this.db.run(`UPDATE videos SET status='ai', ai_status='running' WHERE id=? AND status='queued'`, v.id);
-    const style = JSON.parse(v.style || '{}');
+  _aiStart(client, v) {
+    const p = this._aiOne(client, v).finally(() => { this.aiJobs.delete(v.id); this.aiKick(50); });
+    this.aiJobs.set(v.id, p);
+    return p;
+  }
+
+  /** Gemini (360p copy when possible) for one video. Throws on failure. */
+  async _gemini(client, v, style, { maxAttempts } = {}) {
     let low = null;
     try {
-      // low-bandwidth: send Gemini a 360p copy (ffmpeg, idle priority, one at a time); original if that fails
       const lr = this.settings.get('geminiLowRes');
       let src = v.path;
       if (lr && lr.enabled) {
         low = await makeLowRes(v.path, { outDir: path.join(this.dataDir, 'cache', 'lowres'), height: lr.height, videoKbps: lr.videoKbps, configured: lr.ffmpegPath || '' });
-        if (low.lowres) src = low.path; else if (low.reason && !this._lowresWarned) { this._lowresWarned = true; this.events.warn(`Low-bandwidth copy for Gemini not made (${low.reason}) — sending the original`, { kind: 'ai' }); }
+        if (low.lowres) src = low.path; else if (low.reason && !this._lowresWarned) { this._lowresWarned = true; this.events.warn(`Small copy for Gemini not made (${low.reason}) — sending the original`, { kind: 'ai' }); }
       }
-      const meta = await client.describeVideo(src, style, { maxAttempts: this.settings.get('geminiMaxAttempts'), displayName: v.filename });
+      return await client.describeVideo(src, style, { maxAttempts: maxAttempts || this.settings.get('geminiMaxAttempts'), displayName: v.filename });
+    } finally { if (low && low.lowres) { try { fs.unlinkSync(low.path); } catch (_) { /* gone */ } } }
+  }
+
+  /** Write AI fields: never overwrite what you typed; always fill what is empty. */
+  _writeMeta(id, meta, source) {
+    const cur = this.db.get('SELECT * FROM videos WHERE id=?', id);
+    const keep = f => cur.edited && missingFields(cur).indexOf(f) < 0;   // a hand-edited, non-empty field stays
+    const title = keep('title') ? cur.title : meta.title;
+    const description = keep('description') ? cur.description : meta.description;
+    const tags = keep('tags') ? cur.tags : JSON.stringify(meta.tags || []);
+    const hashtags = cur.edited && cur.hashtags && cur.hashtags !== '[]' ? cur.hashtags : JSON.stringify(meta.hashtags || []);
+    this.db.run(`UPDATE videos SET title=?, description=?, tags=?, hashtags=?, meta_source=? WHERE id=?`, title, description, tags, hashtags, source, id);
+    return this.db.get('SELECT * FROM videos WHERE id=?', id);
+  }
+
+  async _aiOne(client, v) {
+    this.aiBusy.add(v.id);
+    const wasReady = v.status === 'ready';
+    this.db.run(`UPDATE videos SET status='ai', ai_status='running' WHERE id=? AND status IN ('queued','ready')`, v.id);
+    const style = JSON.parse(v.style || '{}');
+    try {
+      const meta = await this._gemini(client, v, style);
       const cur = this.db.get('SELECT * FROM videos WHERE id=?', v.id);
-      const next = style.mode === 'approval' ? 'awaiting_approval' : 'ready';
-      if (cur.edited) this.db.run(`UPDATE videos SET status=?, ai_status='done' WHERE id=?`, next, v.id);
-      else this.db.run(`UPDATE videos SET status=?, ai_status='done', ai_error=NULL, title=?, description=?, tags=?, hashtags=? WHERE id=?`, next, meta.title, meta.description, JSON.stringify(meta.tags), JSON.stringify(meta.hashtags), v.id);
-      this.events.info(`${v.channel_name}: AI title ready — "${meta.title}"${next === 'awaiting_approval' ? ' (needs your OK)' : ''}`, { channelId: v.channel_id, kind: next === 'awaiting_approval' ? 'approval' : 'ai' });
+      if (!cur) return;
+      const next = wasReady ? 'ready' : style.mode === 'approval' ? 'awaiting_approval' : 'ready';
+      const after = this._writeMeta(v.id, meta, 'ai');
+      this.db.run(`UPDATE videos SET status=CASE WHEN status='ai' THEN ? ELSE status END, ai_status='done', ai_error=NULL WHERE id=?`, next, v.id);
+      this.events.info(`${v.channel_name}: AI title ready — "${after.title}"${next === 'awaiting_approval' ? ' (needs your OK)' : ''}`, { channelId: v.channel_id, kind: next === 'awaiting_approval' ? 'approval' : 'ai' });
+      if (this.scheduler) this.scheduler.wake();
     } catch (e) {
       const attempts = (v.ai_attempts || 0) + 1;
       const final = attempts >= 3;
-      this.db.run(`UPDATE videos SET status='queued', ai_status=?, ai_error=?, ai_attempts=? WHERE id=?`, final ? 'failed' : 'retry', e.message.slice(0, 500), attempts, v.id);
+      this.db.run(`UPDATE videos SET status=CASE WHEN status='ai' THEN ? ELSE status END, ai_status=?, ai_error=?, ai_attempts=? WHERE id=?`, wasReady ? 'ready' : 'queued', final ? 'failed' : 'retry', String(e.message).slice(0, 500), attempts, v.id);
       this.aiNextTry.set(v.id, Date.now() + 10 * 60000 * attempts);
-      this.events.error(`${v.channel_name}: AI failed for ${v.filename}${final ? ' (gave up — edit the title by hand)' : ', will retry'}: ${e.message.split('\n')[0]}`, { channelId: v.channel_id, kind: 'ai' });
+      this.events.error(`${v.channel_name}: AI failed for ${v.filename}${final ? ' — a clean title from the file name is used if it is still missing at upload time' : ', will retry'}: ${String(e.message).split('\n')[0]}`, { channelId: v.channel_id, kind: 'ai' });
     } finally {
       this.aiBusy.delete(v.id);
-      if (low && low.lowres) { try { fs.unlinkSync(low.path); } catch (_) { /* gone */ } }
     }
+  }
+
+  /**
+   * Inline, right before an upload: a video still missing title/description/tags gets Gemini now
+   * (waiting for it, with its retries, capped by aiInlineTimeoutMs). If Gemini can't, a clean title
+   * from the file name and a basic description are used. Never throws; returns the updated row.
+   */
+  async ensureMetadata(video, { log = () => {}, file = null } = {}) {
+    let v = this.db.get('SELECT v.*, c.style, c.name AS channel_name FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.id=?', video.id);
+    if (!v || isComplete(v)) return v;
+    // a background job is already on it: wait for that one
+    if (this.aiJobs.has(v.id)) {
+      log(`video ${v.id}: waiting for the AI job already running`);
+      await Promise.race([this.aiJobs.get(v.id).catch(() => {}), new Promise(r => setTimeout(r, this.settings.get('aiInlineTimeoutMs') || 300000))]);
+      v = this.db.get('SELECT v.*, c.style, c.name AS channel_name FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.id=?', video.id);
+      if (isComplete(v)) return v;
+    }
+    const style = JSON.parse(v.style || '{}');
+    const s = this.settings.all();
+    const src = file || (!v.remote ? v.path : null);
+    let meta = null, why = '';
+    if (s.geminiKeys.length && src && fs.existsSync(src)) {
+      this.aiBusy.add(v.id);
+      this.db.run(`UPDATE videos SET ai_status='running' WHERE id=?`, v.id);
+      this.events.info(`${v.channel_name}: writing the title for ${v.filename} now (it is due)`, { channelId: v.channel_id, kind: 'ai' });
+      let timer;
+      try {
+        const job = this._gemini(this.geminiClient(), { ...v, path: src }, style);
+        job.catch(() => {});
+        meta = await Promise.race([job, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('Gemini took too long')), s.aiInlineTimeoutMs || 300000); })]);
+      } catch (e) { why = String(e.message).split('\n')[0]; }
+      finally { clearTimeout(timer); this.aiBusy.delete(v.id); }
+    } else why = !s.geminiKeys.length ? 'no Gemini key' : 'video file not on this PC';
+    if (meta) {
+      const after = this._writeMeta(v.id, meta, 'ai');
+      this.db.run(`UPDATE videos SET ai_status='done', ai_error=NULL WHERE id=?`, v.id);
+      log(`video ${v.id}: AI metadata written inline`);
+      if (isComplete(after)) return after;
+    }
+    const fb = fallbackMeta(v.filename, style);
+    const after = this._writeMeta(v.id, fb, 'filename');
+    this.db.run(`UPDATE videos SET ai_status=CASE WHEN ai_status='running' THEN 'failed' ELSE ai_status END, ai_error=COALESCE(?, ai_error) WHERE id=?`, why || null, v.id);
+    this.events.warn(`${v.channel_name}: AI could not write ${v.filename}${why ? ` (${why})` : ''} — using the title "${after.title}"`, { channelId: v.channel_id, kind: 'ai' });
+    log(`video ${v.id}: file-name fallback metadata (${why})`);
+    return after;
+  }
+
+  /**
+   * Retry policy for a failed upload. Not retried: login expired / verification (→ Needs you; handled
+   * by the runner before this), a missing file. Everything else: up to retry.max automatic retries
+   * after ~5, 15, 45 min (+ jitter), moved into the upload window. Then "failed" with a Retry button.
+   */
+  failUpload(v, err, { channel } = {}) {
+    if (!v) return { action: 'none' };
+    const s = this.settings.all();
+    const msg = String((err && err.message) || err || 'Upload failed').replace(/\u001b\[[0-9;]*m/g, '').split('\n')[0].slice(0, 300);
+    const name = (channel && channel.name) || 'Channel';
+    if (err && (err.code === 'ENOENT' || /ENOENT|no such file|File not found/i.test(msg))) {
+      this.db.run(`UPDATE videos SET status='missing', error=?, error_kind='missing', retry_at=NULL WHERE id=?`, 'File not found', v.id);
+      this.events.error(`${name}: ${v.filename} is missing from the folder — not retried`, { channelId: v.channel_id, kind: 'failed' });
+      return { action: 'missing' };
+    }
+    const r = s.retry || { max: 3, backoffMin: [5, 15, 45], jitterPct: 20 };
+    const n = (v.retry_count || 0) + 1;
+    const kind = err && err.code ? String(err.code).toLowerCase() : 'error';
+    if (n > (r.max ?? 3)) {
+      this.db.run(`UPDATE videos SET status='failed', error=?, error_kind=?, retry_at=NULL WHERE id=?`, msg, kind, v.id);
+      this.events.error(`${name}: upload of "${v.title || v.filename}" failed ${r.max} retries — ${humanizeError(msg)} (press Retry)`, { channelId: v.channel_id, kind: 'failed', detail: err && err.stack });
+      return { action: 'failed' };
+    }
+    const base = (r.backoffMin[Math.min(n - 1, r.backoffMin.length - 1)] || 5) * 60000;
+    const jitter = base * ((r.jitterPct ?? 20) / 100) * (Math.random() * 2 - 1);
+    const at = nextInWindow(Date.now() + base + jitter, s.uploadWindow);
+    this.db.run(`UPDATE videos SET status='ready', error=?, error_kind=?, retry_at=?, retry_count=? WHERE id=?`, msg, kind, at, n, v.id);
+    const hm = new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    this.events.warn(`${name}: upload failed — ${humanizeError(msg)}. Retrying at ${hm} (attempt ${n}/${r.max})`, { channelId: v.channel_id, kind: 'failed', detail: err && err.stack });
+    return { action: 'retry', retryAt: at, attempt: n };
+  }
+
+  /** Stop taking jobs; finish the current upload if it ends within waitMs, else abort it back to the queue; save logins; close browsers. */
+  async windDown({ waitMs = 180000, noExport = false, reason = '' } = {}) {
+    this.windingDown = true;
+    this.runner.stopping = true;
+    try {
+      const t0 = Date.now();
+      while (this.runner.live.size && Date.now() - t0 < waitMs) await new Promise(r => setTimeout(r, 200));
+      if (this.runner.live.size) {
+        this.runner.aborted = true;
+        this.events.warn(`Stopping the upload in progress (${reason}) — it goes back to the queue`, { kind: 'cloud' });
+        for (const chId of [...this.runner.live.keys()]) {
+          const ch = this.db.get('SELECT profile_id FROM channels WHERE id=?', chId);
+          const sess = ch && this.profiles.session(ch.profile_id);
+          if (sess) { if (noExport) sess.noExport = true; else sess.exportReason = 'hand-over'; }
+          if (ch) await this.profiles.close(ch.profile_id).catch(() => {});
+        }
+        const t1 = Date.now();
+        while (this.runner.live.size && Date.now() - t1 < 25000) await new Promise(r => setTimeout(r, 200));
+      }
+      this.db.run(`UPDATE videos SET status='ready' WHERE status='uploading' AND remote=0`);
+      for (const [id, sess] of this.profiles.sessions) { if (noExport) sess.noExport = true; else sess.exportReason = 'hand-over'; void id; }
+      await this.profiles.closeAll();     // saves every open profile's login (unless noExport)
+      if (this.keepAlive) await this.keepAlive.idle();
+    } finally {
+      this.runner.stopping = false; this.runner.aborted = false; this.windingDown = false;
+    }
+  }
+
+  /**
+   * Is this profile's Google account signed in? Opens youtube.com in a throw-away tab (or the given
+   * page), checks the Google auth cookies and where the page ended up. Logs the answer.
+   */
+  async checkSignedIn(prof, sess, { log = true, stayMs = 0, page: usePage = null } = {}) {
+    const ctx = sess.handle.context;
+    const urls = this.settings.get('urls');
+    const page = usePage || await ctx.newPage();
+    let land = { url: '', signIn: false };
+    try {
+      land = await gotoLanding(page, urls.youtube, { timeout: 45000 });
+      if (stayMs) { const t0 = Date.now(); while (Date.now() - t0 < stayMs) { try { await page.mouse.wheel(0, 200 + Math.random() * 400); } catch (_) { /* ignore */ } await new Promise(r => setTimeout(r, 1500 + Math.random() * 2500)); } }
+    } catch (_) { /* judged by cookies */ }
+    let cookies = [];
+    try { cookies = await ctx.cookies(); } catch (_) { /* ignore */ }
+    const ok = googleAuthCookies(cookies).length > 0 && !land.signIn;
+    if (!usePage) await page.close().catch(() => {});
+    this.db.run('UPDATE profiles SET login_state=?, login_note=? WHERE id=?', ok ? 'ok' : 'signed_out', ok ? null : 'Sign in needed', prof.id);
+    if (log) {
+      if (ok) this.events.success(`Profile #${prof.number}: signed in to YouTube`, { kind: 'profile' });
+      else this.events.warn(`Profile #${prof.number}: not signed in to YouTube — sign in needed`, { kind: 'needs_you', detail: land.error || land.url });
+    }
+    return { signedIn: ok, url: land.url };
   }
 
   async activateChannel(channelId) {
@@ -290,7 +522,7 @@ class UploadPilotApp {
   // ---------------- channel / video ops (used by API + UI) ----------------
   listChannels() {
     const today = startOfDay(Date.now()), tomorrow = addDays(today, 1);
-    return this.db.all(`SELECT c.*, f.number AS profile_number, p.host AS proxy_host, p.port AS proxy_port, p.status AS proxy_status,
+    return this.db.all(`SELECT c.*, f.number AS profile_number, f.login_state AS login_state, p.host AS proxy_host, p.port AS proxy_port, p.status AS proxy_status,
       (SELECT COUNT(*) FROM videos v WHERE v.channel_id=c.id AND v.status='done' AND v.uploaded_at>=?) AS done_today,
       (SELECT COUNT(*) FROM videos v WHERE v.channel_id=c.id AND v.scheduled_at>=? AND v.scheduled_at<? AND v.status NOT IN ('skipped','missing')) AS planned_today,
       (SELECT COUNT(*) FROM videos v WHERE v.channel_id=c.id AND v.status IN ('queued','ai','awaiting_approval','ready')) AS queue,
@@ -335,7 +567,13 @@ class UploadPilotApp {
   async updateChannel(id, patch) {
     const ch = this.db.get('SELECT * FROM channels WHERE id=?', id);
     if (!ch) return null;
-    if (patch.style) this.db.run('UPDATE channels SET style=? WHERE id=?', JSON.stringify(normalizeStyle({ ...JSON.parse(ch.style || '{}'), ...patch.style })), id);
+    if (patch.style) {
+      const before = JSON.parse(ch.style || '{}');
+      const next = normalizeStyle({ ...before, ...patch.style });
+      this.db.run('UPDATE channels SET style=? WHERE id=?', JSON.stringify(next), id);
+      if ((before.perDay || null) !== (next.perDay || null)) this.replanFuture(+id);     // re-spread this channel's future slots
+      if (before.mode !== next.mode && this.scheduler) this.scheduler.wake();
+    }
     if (patch.name) this.db.run('UPDATE channels SET name=? WHERE id=?', String(patch.name).slice(0, 200), id);
     if (patch.folder && patch.folder !== ch.folder) {
       if (!fs.existsSync(patch.folder)) throw Object.assign(new Error('Folder not found'), { status: 400 });
@@ -357,26 +595,49 @@ class UploadPilotApp {
     return this.db.all('SELECT * FROM videos WHERE channel_id=? ORDER BY CASE WHEN scheduled_at IS NULL THEN 1 ELSE 0 END, scheduled_at, id', channelId)
       .map(v => ({ ...v, tags: JSON.parse(v.tags || '[]'), hashtags: JSON.parse(v.hashtags || '[]') }));
   }
+  /**
+   * Autosave from the channel table: only the fields sent are written, and only when they changed.
+   * scheduled_at: a date, 'now', or a past time (= the next free lane slot). Takes effect at once:
+   * DB, scheduler (woken), AI queue (an earlier time jumps it), cloud (pushed now).
+   */
   updateVideo(id, patch) {
     const v = this.db.get('SELECT v.*, c.style FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.id=?', id);
     if (!v) return null;
-    if (['uploading', 'done'].includes(v.status)) throw Object.assign(new Error(`Video is ${v.status}, can't edit`), { status: 409 });
+    if (['uploading', 'done'].includes(v.status)) throw Object.assign(new Error(`Video is ${v.status === 'done' ? 'published' : 'uploading'}, can't edit`), { status: 409 });
     const sets = [], vals = [];
-    if (patch.title !== undefined) { const t = String(patch.title).trim(); if (!t || [...t].length > 100) throw Object.assign(new Error('Title must be 1-100 characters'), { status: 400 }); sets.push('title=?'); vals.push(t); }
-    if (patch.description !== undefined) { sets.push('description=?'); vals.push(String(patch.description).slice(0, 4500)); }
-    if (patch.tags !== undefined) { sets.push('tags=?'); vals.push(JSON.stringify((Array.isArray(patch.tags) ? patch.tags : String(patch.tags).split(',')).map(t => t.trim()).filter(Boolean))); }
-    if (patch.hashtags !== undefined) { sets.push('hashtags=?'); vals.push(JSON.stringify((Array.isArray(patch.hashtags) ? patch.hashtags : String(patch.hashtags).split(/[\s,]+/)).map(t => t.trim()).filter(Boolean))); }
-    if (patch.scheduled_at !== undefined) { sets.push('scheduled_at=?'); vals.push(patch.scheduled_at ? +new Date(patch.scheduled_at) : null); }
-    if (!sets.length) return this.listVideos(v.channel_id).find(x => x.id === +id);
-    if (['title', 'description', 'tags', 'hashtags'].some(k => patch[k] !== undefined)) sets.push('edited=1');
-    this.db.run(`UPDATE videos SET ${sets.join(', ')} WHERE id=?`, ...vals, id);
-    // a hand-written title makes the video uploadable even if AI never ran / failed
+    let metaEdited = false;
+    const put = (col, val) => { sets.push(`${col}=?`); vals.push(val); };
+    if (patch.title !== undefined) {
+      const t = String(patch.title ?? '').trim();
+      if ([...t].length > 100) throw Object.assign(new Error('Title must be 100 characters or less'), { status: 400 });
+      if ((t || null) !== (v.title || null)) { put('title', t || null); if (t) metaEdited = true; }
+    }
+    if (patch.description !== undefined) { const d = String(patch.description ?? '').slice(0, 4500); if ((d || null) !== (v.description || null)) { put('description', d || null); if (d.trim()) metaEdited = true; } }
+    const listOf = (x, re) => (Array.isArray(x) ? x : String(x ?? '').split(re)).map(t => String(t).trim()).filter(Boolean);
+    if (patch.tags !== undefined) { const j = JSON.stringify(listOf(patch.tags, ',')); if (j !== (v.tags || '[]')) { put('tags', j); if (j !== '[]') metaEdited = true; } }
+    if (patch.hashtags !== undefined) { const j = JSON.stringify(listOf(patch.hashtags, /[\s,]+/)); if (j !== (v.hashtags || '[]')) put('hashtags', j); }
+    let timeChanged = false, movedEarlier = false;
+    if (patch.scheduled_at !== undefined) {
+      let t = patch.scheduled_at === 'now' ? Date.now() : patch.scheduled_at ? +new Date(patch.scheduled_at) : null;
+      if (t != null && !Number.isFinite(t)) throw Object.assign(new Error('Invalid date / time'), { status: 400 });
+      if (t != null && t < Date.now()) t = Date.now();          // a past time = upload at the next free lane slot
+      if (t !== v.scheduled_at) { put('scheduled_at', t); timeChanged = true; movedEarlier = t != null && (v.scheduled_at == null || t < v.scheduled_at); }
+      if (v.retry_at && t != null) { put('retry_at', null); }   // a new time from you replaces a pending retry time
+    }
+    if (metaEdited) put('edited', 1);
+    if (sets.length) this.db.run(`UPDATE videos SET ${sets.join(', ')} WHERE id=?`, ...vals, id);
     const cur = this.db.get('SELECT * FROM videos WHERE id=?', id);
-    if (cur.title && ['queued', 'failed'].includes(cur.status) && cur.ai_status !== 'running') {
+    // a hand-written title makes the video uploadable even if AI never ran / failed (missing parts are filled at upload)
+    if (metaEdited && cur.title && ['queued', 'failed'].includes(cur.status) && cur.ai_status !== 'running') {
       const mode = JSON.parse(v.style || '{}').mode;
-      this.db.run(`UPDATE videos SET status=?, ai_status=CASE WHEN ai_status='done' THEN 'done' ELSE 'manual' END WHERE id=?`, mode === 'approval' && cur.status !== 'failed' ? 'awaiting_approval' : 'ready', id);
+      this.db.run(`UPDATE videos SET status=?, retry_count=CASE WHEN status='failed' THEN 0 ELSE retry_count END, ai_status=CASE WHEN ai_status IN ('done','pending','retry') THEN ai_status ELSE 'manual' END WHERE id=?`, mode === 'approval' && cur.status !== 'failed' ? 'awaiting_approval' : 'ready', id);
     }
     if (cur.scheduled_at == null) this.plan(v.channel_id);
+    if (sets.length) {
+      if (timeChanged && this.scheduler) this.scheduler.wake();
+      if (movedEarlier || timeChanged) this.aiKick();
+      if (this.cloud.sync) this.cloud.sync.pushNow().catch(() => {});
+    }
     return this.listVideos(v.channel_id).find(x => x.id === +id);
   }
   approveVideo(id) {
@@ -387,12 +648,50 @@ class UploadPilotApp {
   retryVideo(id) {
     const v = this.db.get('SELECT * FROM videos WHERE id=?', id);
     if (!v || !['failed', 'missing', 'skipped'].includes(v.status)) throw Object.assign(new Error('Only failed/skipped videos can be retried'), { status: 409 });
-    this.db.run(`UPDATE videos SET status=?, error=NULL, scheduled_at=NULL WHERE id=?`, v.title ? 'ready' : 'queued', id);
+    this.db.run(`UPDATE videos SET status=?, error=NULL, error_kind=NULL, retry_at=NULL, retry_count=0, scheduled_at=? WHERE id=?`, v.title ? 'ready' : 'queued', Date.now(), id);
     if (!v.title) this.db.run(`UPDATE videos SET ai_status='pending', ai_attempts=0 WHERE id=?`, id);
-    this.plan(v.channel_id);
+    if (this.scheduler) this.scheduler.wake();
+    this.aiKick();
     return this.db.get('SELECT * FROM videos WHERE id=?', id);
   }
   skipVideo(id) { this.db.run(`UPDATE videos SET status='skipped' WHERE id=? AND status NOT IN ('uploading','done')`, id); return this.db.get('SELECT * FROM videos WHERE id=?', id); }
+
+  /**
+   * Everything that needs the user, each with a one-click fix: {id, level, text, actions:[{label, action, arg}]}.
+   * action names are handled by the UI (open-profile, resume, retry, takeover, signin, unlock, legacy,
+   * drive, settings, channel).
+   */
+  needsYou() {
+    const items = [];
+    const c = this.cloud, st = c.state;
+    const add = (id, text, actions, level = 'warn') => items.push({ id, level, text, actions });
+    if (c.notice && c.notice.kind === 'handed_over' && st !== 'online') add('handed', c.notice.text, [{ label: 'Sign in', action: 'signin' }], 'info');
+    else if (!c.online && c.cfg.handedOverTo && st !== 'online') add('handed', `Signed out — now active on ${c.cfg.handedOverTo}`, [{ label: 'Sign in', action: 'signin' }], 'info');
+    if (c.online) {
+      const k = c.keys;
+      if (k && !k.ready) {
+        if (k.state === 'requesting') add('keys', 'Waiting for one of your other signed-in PCs to unlock the saved logins…', [{ label: 'Start fresh instead', action: 'start-fresh' }]);
+        else add('keys', 'Your password was changed or reset: unlock the saved logins on this PC', [{ label: 'Unlock', action: 'unlock' }]);
+      }
+      if (k && k.ready && c._legacyNeeded) add('legacy', 'Enter your old sync passphrase once (from version 0.3.0)', [{ label: 'Enter passphrase', action: 'legacy' }]);
+      const ap = c.activePc && c.activePc.status();
+      if (c.singleActive && ap && !ap.me && ap.other) add('active', `UploadPilot is active on ${ap.other.pcName}`, [{ label: 'Take over', action: 'takeover' }], 'info');
+      if (k && k.ready && !c.googleAuth().connected) add('drive', 'Connect Google Drive once (for every PC): it carries your Google logins and backups', [{ label: 'Connect Drive', action: 'drive' }]);
+    }
+    if (!this.settings.get('geminiKeys').length) add('gemini', 'Add a Gemini API key so titles and descriptions are written for you', [{ label: 'Add key', action: 'settings' }]);
+    for (const ch of this.db.all(`SELECT c.id, c.name, c.status, c.status_reason, c.profile_id, p.login_state, p.login_note, p.number FROM channels c LEFT JOIN profiles p ON p.id=c.profile_id WHERE c.status IN ('active','paused','needs_you')`)) {
+      if (ch.status === 'needs_you') add(`ch${ch.id}`, `${ch.name || 'Channel'}: ${ch.status_reason || 'needs you'}`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }, { label: 'Resume', action: 'resume', arg: ch.id }]);
+      else if (ch.login_state === 'signed_out') add(`login${ch.id}`, `${ch.name || 'Channel'}: sign in needed`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }]);
+      else if (ch.login_state === 'restore_failed') add(`login${ch.id}`, `${ch.name || 'Channel'}: ${ch.login_note || 'login not restored'}`, [{ label: 'Open profile', action: 'open-profile', arg: ch.id }]);
+    }
+    for (const v of this.db.all(`SELECT v.id, v.title, v.filename, v.error, v.status, v.channel_id, c.name FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.status IN ('failed','missing') ORDER BY v.id DESC LIMIT 20`)) {
+      add(`v${v.id}`, `${v.name}: "${v.title || v.filename}" ${v.status === 'missing' ? 'file is missing' : 'failed — ' + humanizeError(v.error || '')}`, [{ label: 'Retry', action: 'retry', arg: v.id }], 'error');
+    }
+    for (const r of this.db.all(`SELECT channel_id, c.name, COUNT(*) AS n FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.status='awaiting_approval' GROUP BY channel_id`)) {
+      add(`ok${r.channel_id}`, `${r.name}: ${r.n} video(s) need your OK`, [{ label: 'Review', action: 'channel', arg: r.channel_id }], 'info');
+    }
+    return items;
+  }
 
   dashboard() {
     const today = startOfDay(Date.now()), tomorrow = addDays(today, 1);
@@ -407,7 +706,11 @@ class UploadPilotApp {
       publishedToday: this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status='done' AND uploaded_at>=?`, today).n,
       plannedToday: this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE scheduled_at>=? AND scheduled_at<? AND status NOT IN ('skipped','missing')`, today, tomorrow).n,
       inQueue: this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status IN ('queued','ai','awaiting_approval','ready')`).n,
-      needsYou: chans.filter(c => c.status === 'needs_you').length + this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status IN ('failed','awaiting_approval')`).n,
+      needsYou: this.needsYou().length,
+      needsYouItems: this.needsYou(),
+      activeOn: this.cloud.online && this.cloud.activePc ? (this.cloud.activePc.status().activePcName || null) : (this.cloud.online ? this.cloud.pcName : null),
+      activeIsMe: this.cloud.online ? !!(this.cloud.activePc && this.cloud.activePc.isActive) : true,
+      pcCount: this.cloud.sync ? this.cloud.sync.status().pcs.length : 1,
       needsYouDetail: { channels: chans.filter(c => c.status === 'needs_you').length, failed: this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status='failed'`).n, approval: this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status='awaiting_approval'`).n },
       nextUpload: nextRow?.t || null,
       autopilot: { paused: !!s.autopilotPaused, userActive: this.userActive(), inWindow: inWindow(Date.now(), s.uploadWindow), window: s.uploadWindow, lanes: this.scheduler ? this.scheduler.status().lanes : [] },
@@ -457,9 +760,7 @@ class UploadPilotApp {
     if (this.started && cloudKeysChanged) this.cloudReady = this.cloud.reconnect().catch(e => { this.events.error(`Cloud: ${e.message}`, { kind: 'cloud' }); });
     if (this.started && (before.lanes !== after.lanes || JSON.stringify(before.delayRangeMin) !== JSON.stringify(after.delayRangeMin))) await this.restartScheduler();
     if (JSON.stringify(before.uploadWindow) !== JSON.stringify(after.uploadWindow) || before.videosPerDay !== after.videosPerDay) {
-      // re-spread future, not-yet-uploaded slots
-      this.db.run(`UPDATE videos SET scheduled_at=NULL WHERE status IN ('queued','awaiting_approval','ready') AND scheduled_at>?`, Date.now());
-      this.replanAll();
+      this.replanFuture();
     }
     return { settings: this.settings.publicView(), proxyImport: this._lastProxyImport || null };
   }

@@ -16,7 +16,6 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { encryptString, decryptString } = require('./crypto');
 const { withTimeout } = require('./store/common');
 
 const newId = () => crypto.randomBytes(15).toString('base64').replace(/[+/=]/g, c => ({ '+': 'A', '/': 'B', '=': '' }[c])).slice(0, 20);
@@ -35,7 +34,7 @@ class CloudSync {
    * @param {string} o.root           users/<uid>
    * @param {string} o.pcId
    * @param {string} o.pcName
-   * @param {() => string|null} o.passphrase
+   * @param {object} o.keys        KeyManager (account data key) — encrypts proxy passwords
    * @param {number} [o.pushMs=2000]
    * @param {number} [o.activityFlushMs=15000]
    */
@@ -117,11 +116,10 @@ class CloudSync {
     let proxyDoc = null;
     if (proxy) {
       proxyDoc = { host: proxy.host, port: proxy.port, username: proxy.username || '' };
-      const pass = this.passphrase();
       const shadow = parse(r.cloud_shadow, {});
       // keep the previous ciphertext when the password didn't change (no write churn: AES-GCM is randomized)
       if (shadow.proxy && shadow.proxy.host === proxy.host && shadow.proxy.port === proxy.port && shadow.proxy.username === (proxy.username || '') && shadow.proxy._pw === sha(proxy.password || '')) { proxyDoc.passwordEnc = shadow.proxy.passwordEnc || null; }
-      else proxyDoc.passwordEnc = pass && proxy.password ? encryptString(proxy.password, pass) : null;
+      else proxyDoc.passwordEnc = this.keys && this.keys.ready && proxy.password ? this.keys.encString(proxy.password) : null;
       proxyDoc._pw = sha(proxy.password || '');
     }
     return { number: r.number, name: r.name, proxy: proxyDoc, createdAt: r.created_at };
@@ -143,6 +141,7 @@ class CloudSync {
       status: COARSE[r.status] || 'queued', detail: r.status, scheduledAt: r.scheduled_at,
       title: r.title, description: r.description, tags: parse(r.tags, []), hashtags: parse(r.hashtags, []), edited: !!r.edited,
       aiStatus: r.ai_status, aiError: r.ai_error, url: r.url, error: r.error, attempts: r.attempts || 0, uploadedAt: r.uploaded_at,
+      retryAt: r.retry_at || null, retryCount: r.retry_count || 0, errorKind: r.error_kind || null,
       driveFileId: r.drive_file_id, createdAt: r.created_at,
     };
   }
@@ -270,13 +269,13 @@ class CloudSync {
   _applyProfileState(row, d) {
     if (d.stateVersion && d.stateVersion !== row.cloud_state_version) this.db.run('UPDATE profiles SET cloud_state_version=?, cloud_state_hash=?, cloud_state_file=?, cloud_state_by=? WHERE id=?', d.stateVersion, d.stateHash || null, d.stateFileId || null, d.stateBy || null, row.id);
   }
-  _proxyPw(p) { if (!p || !p.passwordEnc) return ''; const pass = this.passphrase(); if (!pass) return null; try { return decryptString(p.passwordEnc, pass); } catch (_) { return null; } }
+  _proxyPw(p) { if (!p || !p.passwordEnc) return ''; if (!this.keys || !this.keys.ready) return null; try { return this.keys.decString(p.passwordEnc); } catch (_) { return null; } }
   _ensureProxy(p) {
     const pw = this._proxyPw(p);
     this.db.run('INSERT OR IGNORE INTO proxies(host,port,username,password) VALUES(?,?,?,?)', p.host, p.port, p.username || '', pw || '');
     const row = this.db.get(`SELECT * FROM proxies WHERE host=? AND port=? AND IFNULL(username,'')=?`, p.host, p.port, p.username || '');
     if (pw && row.password !== pw) this.db.run(`UPDATE proxies SET password=?, status='unknown' WHERE id=?`, pw, row.id);
-    if (pw === null && !row.password) this.app.events.warn(`Proxy ${p.host}:${p.port} came from another PC but its password can't be read — set the same sync passphrase in Settings → Cloud`, { kind: 'sync' });
+    if (pw === null && !row.password) this.app.events.warn(`Proxy ${p.host}:${p.port} came from another PC but its password can't be read yet (account locked on this PC)`, { kind: 'sync' });
     return row.id;
   }
 
@@ -367,6 +366,10 @@ class CloudSync {
         if (ok.includes('attempts')) set('attempts', d.attempts || 0);
         if (ok.includes('uploadedAt')) set('uploaded_at', d.uploadedAt || null);
         if (ok.includes('driveFileId')) set('drive_file_id', d.driveFileId || null);
+        if (ok.includes('retryAt')) set('retry_at', d.retryAt || null);
+        if (ok.includes('retryCount')) set('retry_count', d.retryCount || 0);
+        if (ok.includes('errorKind')) set('error_kind', d.errorKind || null);
+        if (ok.includes('scheduledAt') || ok.includes('retryAt') || ok.includes('detail')) this._videosTouched = true;
         if (sets.length) this.db.run(`UPDATE videos SET ${sets.join(', ')} WHERE id=?`, ...vals, row.id);
         this.db.run('UPDATE videos SET cloud_shadow=? WHERE id=?', JSON.stringify(this._newShadow(row, d, this._fieldsChanged(d, parse(row.cloud_shadow, null)).filter(k => !ok.includes(k)))), row.id);
         // another PC published a video whose file lives here: tidy it into Done/ like a local upload would
@@ -375,6 +378,8 @@ class CloudSync {
       }
     }));
     for (const id of doneMoves) { try { this.onRemoteDone && this.onRemoteDone(id); } catch (_) { /* ignore */ } }
+    // a time / status edited on another PC takes effect here at once (scheduler + AI queue)
+    if (this._videosTouched) { this._videosTouched = false; try { this.onVideosChanged && this.onVideosChanged(); } catch (_) { /* ignore */ } }
   }
 
   // ------------------------------------------------------------------ activity

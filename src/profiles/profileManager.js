@@ -8,6 +8,37 @@ const { checkProxy } = require('../proxy/check');
 const { parseProxyList, parseProxyLine, proxyLabel } = require('../proxy/parse');
 const { launchProfileBrowser } = require('./browser');
 
+const ACCOUNTS_HOST = /(^|\.)accounts\.google\.|\/ServiceLogin|\/signin\b|\/v3\/signin/i;
+const plain = e => String((e && e.message) || e).replace(/\u001b\[[0-9;]*m/g, '').split('\n')[0].replace(/^[a-zA-Z.]+: /, '').slice(0, 160);
+
+/**
+ * page.goto that understands redirects: Studio answers a signed-out profile with a redirect to
+ * accounts.google.com, which Playwright reports as net::ERR_ABORTED / "frame was detached". That is
+ * not an error: wait for the page to settle and read where it ended up.
+ * Returns {url, signIn, error?, detail?}.
+ */
+async function gotoLanding(page, url, { timeout = 60000 } = {}) {
+  let err = null;
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout }); }
+  catch (e) { err = e; }
+  if (err && !/ERR_ABORTED|frame was detached|Navigation .* interrupted|net::ERR_ABORTED|interrupted by another navigation/i.test(err.message || '')) {
+    return { url: safeUrl(page), signIn: false, error: humanNetError(err), detail: String(err.message || err) };
+  }
+  if (err) { try { await page.waitForLoadState('domcontentloaded', { timeout: 30000 }); } catch (_) { /* best effort */ } }
+  // a redirect may still be on its way
+  for (let i = 0; i < 10 && !page.isClosed?.(); i++) { const u = safeUrl(page); if (u && u !== 'about:blank' && !/^data:|^chrome-error:/.test(u)) break; await new Promise(r => setTimeout(r, 300)); }
+  const final = safeUrl(page);
+  return { url: final, signIn: ACCOUNTS_HOST.test(final || '') };
+}
+const safeUrl = p => { try { return p.url(); } catch (_) { return ''; } };
+function humanNetError(e) {
+  const m = /net::(ERR_[A-Z_]+)/.exec((e && e.message) || '');
+  const map = { ERR_PROXY_CONNECTION_FAILED: 'proxy connection failed', ERR_TUNNEL_CONNECTION_FAILED: 'proxy tunnel failed', ERR_SOCKS_CONNECTION_FAILED: 'proxy connection failed', ERR_NAME_NOT_RESOLVED: 'site not found', ERR_INTERNET_DISCONNECTED: 'no internet', ERR_CONNECTION_TIMED_OUT: 'connection timed out', ERR_TIMED_OUT: 'timed out', ERR_CONNECTION_REFUSED: 'connection refused', ERR_CONNECTION_RESET: 'connection reset' };
+  if (m) return map[m[1]] || m[1].toLowerCase().replace(/^err_/, '').replace(/_/g, ' ');
+  if (/Timeout/i.test((e && e.message) || '')) return 'timed out';
+  return plain(e);
+}
+
 class ProfileManager {
   constructor({ db, settings, events, dataDir, launcher = launchProfileBrowser, proxyChecker = checkProxy }) {
     this.db = db; this.settings = settings; this.events = events; this.dataDir = dataDir;
@@ -130,13 +161,13 @@ class ProfileManager {
   async open(profileId, { purpose = 'manual', startUrl, skipProxyCheck = false, windowMode, headless } = {}) {
     if (this.sessions.has(profileId)) {
       const s = this.sessions.get(profileId);
-      if (purpose === 'auto' && s.purpose !== 'auto') throw Object.assign(new Error('Profile is open for manual use'), { code: 'PROFILE_BUSY' });
+      if ((purpose === 'auto' || purpose === 'keepalive') && s.purpose !== purpose) throw Object.assign(new Error('Profile is open for manual use'), { code: 'PROFILE_BUSY' });
       if (s.handle.isClosed()) { await this.close(profileId); } else return s;
     }
     if (this._opening.has(profileId)) return this._opening.get(profileId);
     // load rule: never more browsers than lanes (autopilot waits; manual windows count too)
     const maxBrowsers = Math.max(1, this.settings.get('lanes') || 3);
-    if (purpose === 'auto' && this.sessions.size + this._opening.size >= maxBrowsers) throw Object.assign(new Error(`Browser limit reached (${maxBrowsers} open)`), { code: 'BROWSER_LIMIT' });
+    if ((purpose === 'auto' || purpose === 'keepalive') && this.sessions.size + this._opening.size >= maxBrowsers) throw Object.assign(new Error(`Browser limit reached (${maxBrowsers} open)`), { code: 'BROWSER_LIMIT' });
     const p = (async () => {
       const prof = this.getProfile(profileId);
       if (!prof) throw new Error(`Profile ${profileId} not found`);
@@ -165,7 +196,7 @@ class ProfileManager {
       try {
         handle = await this.launcher({
           userDataDir: prof.data_dir, proxyUrl: bridge ? bridge.url : null, cfg,
-          windowMode: windowMode || (purpose === 'auto' ? cfg.windowMode : 'normal'),
+          windowMode: windowMode || (purpose === 'auto' || purpose === 'keepalive' ? cfg.windowMode : 'normal'),
           headless: headless ?? cfg.headless,
         });
       } catch (e) { if (bridge) await bridge.stop(); throw e; }
@@ -180,17 +211,22 @@ class ProfileManager {
       this.db.run('UPDATE profiles SET last_opened=? WHERE id=?', Date.now(), profileId);
       // newer login from another PC is imported before anything navigates
       await this._hook('afterLaunch', prof, sess);
-      if (purpose !== 'auto' && this.hooks && this.hooks.beforeClose) {
+      if (purpose !== 'auto' && purpose !== 'keepalive' && this.hooks && this.hooks.beforeClose) {
         // a hand-used window may be closed with the X button (no chance to export then): snapshot now and then
         const every = Math.max(1, cfg.snapshotEveryMin || 3) * 60000;
         sess.snapTimer = setInterval(() => { if (!sess.handle.isClosed()) this._hook('beforeClose', prof, sess).catch(() => {}); }, every);
         if (sess.snapTimer.unref) sess.snapTimer.unref();
       }
+      this.events.info(`Profile #${prof.number} opened${purpose === 'auto' ? '' : purpose === 'keepalive' ? ' (daily keep-alive)' : ` (${purpose})`}${sess.exitIp ? ` · exit IP ${sess.exitIp}` : ''}`, { kind: 'profile' });
       if (startUrl) {
         const page = handle.context.pages()[0] || await handle.context.newPage();
-        await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => this.events.warn(`Profile #${prof.number}: could not load ${startUrl}: ${e.message}`));
+        sess.landing = await gotoLanding(page, startUrl);
+        if (sess.landing.error) this.events.warn(`Profile #${prof.number}: Studio did not load (${sess.landing.error})`, { kind: 'profile', detail: sess.landing.detail });
+        else if (sess.landing.signIn && purpose !== 'link') {
+          this.events.warn(`Profile #${prof.number}: sign in needed — the window is open for you`, { kind: 'needs_you', detail: `final URL ${sess.landing.url}` });
+          this.db.run(`UPDATE profiles SET login_state='signed_out', login_note=? WHERE id=?`, 'Sign in needed', profileId);
+        }
       }
-      this.events.info(`Profile #${prof.number} opened (${purpose})${sess.exitIp ? ` · exit IP ${sess.exitIp}` : ''}`, { kind: 'profile' });
       return sess;
     }
   }
@@ -223,4 +259,4 @@ class ProfileManager {
   async closeAll() { for (const id of [...this.sessions.keys()]) await this.close(id); }
 }
 
-module.exports = { ProfileManager };
+module.exports = { ProfileManager, gotoLanding, humanNetError };

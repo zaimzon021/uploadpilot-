@@ -1,5 +1,5 @@
 rules_version = '2';
-// UploadPilot v0.3 — every document lives under users/{uid}; only that signed-in user can touch it.
+// UploadPilot v0.3.1 — every document lives under users/{uid}; only that signed-in user can touch it.
 // Leases (job + profile locks) are the only documents with extra rules: they must carry the server
 // time (renewedAt == request.time), and another PC may only take one over once it has expired by the
 // SERVER clock, so a PC with a wrong local clock can never steal a live lease.
@@ -43,7 +43,10 @@ service cloud.firestore {
         allow read, write: if owner(uid);
       }
       match /meta/{id} {
-        allow read, write: if owner(uid);
+        allow read: if owner(uid);
+        // v0.3.1 meta/activePc (one active PC per account): every write carries the writer's pcId and the server time
+        allow write: if owner(uid) && (id != 'activePc'
+          || (request.resource != null && request.resource.data.pcId is string && request.resource.data.renewedAt == request.time));
       }
 
       // ---- leases: {pcId, pcName, kind, renewedAt (server time), ttlSec, expiresAt (client estimate), released}

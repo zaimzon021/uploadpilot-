@@ -17,6 +17,7 @@ class LaneScheduler {
    * @param {number} [o.idleMs=30000]  how long an idle lane waits before looking again
    * @param {number} [o.cooldownMs=600000] a channel isn't picked again this soon after its last run
    * @param {() => boolean} [o.canStart]  gate for starting NEW runs (e.g. false while the user uses the PC)
+   * @param {() => (number|null)} [o.getNextDueAt]  earliest future due time; an idle lane sleeps only until then
    */
   constructor(o) {
     this.o = { idleMs: 30000, cooldownMs: 10 * 60000, now: () => Date.now(), rng: Math.random, onEvent: () => {}, ...Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) };
@@ -25,7 +26,8 @@ class LaneScheduler {
     this.lastRun = new Map();
     this.order = []; this.orderDay = null;
     this.laneState = [];
-    this._wakers = new Set();
+    this._wakers = new Set();      // idle sleeps: wake() ends them (a time edit, a new video, the cloud coming up)
+    this._delayWakers = new Set(); // humanized waits between channels: only stop() ends them
     this._loops = [];
   }
 
@@ -61,20 +63,32 @@ class LaneScheduler {
 
   nextDelayMs() { const { min, max } = this.o.delayRangeMin; return Math.round(randFloat(this.o.rng, min, max) * 60000); }
 
-  _sleep(ms) {
+  _sleep(ms, { idle = true } = {}) {
+    const set = idle ? this._wakers : this._delayWakers;
     return new Promise(resolve => {
-      const w = () => { clearTimeout(t); this._wakers.delete(w); resolve(); };
-      const t = setTimeout(w, ms);
-      this._wakers.add(w);
+      const w = () => { clearTimeout(t); set.delete(w); resolve(); };
+      const t = setTimeout(w, Math.max(0, ms));
+      set.add(w);
     });
   }
+  /** Something changed (a time edit, a new ready video): idle lanes look again now. Waits between channels are kept. */
   wake() { for (const w of [...this._wakers]) w(); }
+  _wakeAll() { for (const w of [...this._wakers, ...this._delayWakers]) w(); }
+
+  /** How long an idle lane sleeps: until the next due time when it is sooner than the idle poll. */
+  idleSleepMs() {
+    let ms = this.o.idleMs;
+    if (this.o.getNextDueAt) {
+      try { const t = this.o.getNextDueAt(); if (t != null) ms = Math.min(ms, Math.max(200, t - this.o.now() + 50)); } catch (_) { /* keep idle poll */ }
+    }
+    return ms;
+  }
 
   async _laneLoop(lane) {
     const st = this.laneState[lane] = { lane, state: 'idle', channelId: null, until: null };
     while (this.running) {
       const id = this.claimNext(lane);
-      if (id == null) { st.state = 'idle'; st.until = this.o.now() + this.o.idleMs; await this._sleep(this.o.idleMs); continue; }
+      if (id == null) { const ms = this.idleSleepMs(); st.state = 'idle'; st.until = this.o.now() + ms; await this._sleep(ms); continue; }
       st.state = 'running'; st.channelId = id; st.until = null;
       this.o.onEvent({ type: 'start', lane, channelId: id });
       try { await this.o.runChannel(id, lane); this.o.onEvent({ type: 'end', lane, channelId: id }); }
@@ -84,7 +98,7 @@ class LaneScheduler {
       const d = this.nextDelayMs();
       st.state = 'waiting'; st.until = this.o.now() + d;
       this.o.onEvent({ type: 'wait', lane, ms: d });
-      await this._sleep(d);
+      await this._sleep(d, { idle: false });
     }
     st.state = 'stopped';
   }
@@ -94,7 +108,7 @@ class LaneScheduler {
     this.running = true;
     this._loops = Array.from({ length: this.o.lanes }, (_, i) => this._laneLoop(i));
   }
-  async stop() { this.running = false; this.wake(); await Promise.all(this._loops); this._loops = []; }
+  async stop() { this.running = false; this._wakeAll(); await Promise.all(this._loops); this._loops = []; }
   status() { return { running: this.running, lanes: this.laneState.map(s => ({ ...s })), inProgress: [...this.inProgress.entries()] }; }
 }
 

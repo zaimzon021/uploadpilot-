@@ -1,7 +1,7 @@
 {
   "name": "uploadpilot",
   "productName": "UploadPilot",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Auto-upload videos to many YouTube channels through YouTube Studio in isolated browser profiles, synced across PCs",
   "main": "electron/main.js",
   "author": "UploadPilot",

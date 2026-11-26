@@ -56,13 +56,12 @@ test('emulator: two PCs with the real SDK sync channels/videos and never upload 
   const mk = async (name, create) => {
     const app = new UploadPilotApp({
       dataDir: tmpDir(`em-${name}-`), startApi: false, launcher: fakeLauncher(), proxyChecker: async () => ({ ok: true, ip: '1.2.3.4' }),
-      settings: { autopilotPaused: true, uploadWindow: { start: '00:00', end: '24:00' }, geminiLowRes: { enabled: false }, cloud: { mode: 'auto', firebaseConfig: JSON.stringify(FB), emulator: EM, pcName: name, takeoverGraceMin: 0, backup: { enabled: false, idleHours: { start: '00:00', end: '00:00' } } } },
+      settings: { autopilotPaused: true, uploadWindow: { start: '00:00', end: '24:00' }, geminiLowRes: { enabled: false }, cloud: { mode: 'auto', firebaseConfig: JSON.stringify(FB), emulator: EM, pcName: name, takeoverGraceMin: 0, singleActivePc: false, verifyAfterRestore: false, backup: { enabled: false, idleHours: { start: '00:00', end: '00:00' } } } },
       engineOpts: { speed: 0, uploadImpl: async (p, job, { video }) => { uploads.push({ pc: name, id: video.cloud_id }); await new Promise(r => setTimeout(r, 300)); return { url: 'https://youtu.be/x' }; } },
       cloud: { leaseOpts: { renewMs: 2000 }, syncOpts: { pushMs: 300, activityFlushMs: 1000 } },
     });
     await app.start({ api: false }); await app.cloudReady;
     await app.cloud.signIn('pc' + email, 'secret123', { create });
-    await app.cloud.setPassphrase('emulator-pass');
     return app;
   };
   const A = await mk('PC-A', true), B = await mk('PC-B', false);
@@ -85,4 +84,32 @@ test('emulator: two PCs with the real SDK sync channels/videos and never upload 
   const q = A.cloud.status().quota;
   assert.ok(q.writes < 100, `writes ${q.writes}`);
   await A.stop(); await B.stop();
+});
+
+test('emulator v0.3.1: meta/activePc rule (pcId + server time), account key, restart signs in again with no password', { skip: !ON && 'FIRESTORE_EMULATOR_HOST not set', timeout: 90000 }, async () => {
+  const a = store();
+  const u = await a.auth.signUp('ap' + email, 'secret123');
+  const root = `users/${u.uid}`;
+  // the activePc doc must carry pcId and the server time
+  await assert.rejects(a.set(`${root}/meta/activePc`, { pcId: 'x', pcName: 'X', renewedAt: Date.now() }), e => e.code === 'permission-denied');
+  await assert.rejects(a.set(`${root}/meta/activePc`, { pcName: 'X', renewedAt: a.SERVER_TS }), e => e.code === 'permission-denied');
+  await a.set(`${root}/meta/activePc`, { pcId: 'x', pcName: 'X', since: a.SERVER_TS, renewedAt: a.SERVER_TS, handedOver: false });
+  await a.set(`${root}/meta/settings`, { enc: 'abc', updatedBy: 'x' });   // other meta docs: owner only
+  await a.close();
+  // a full app: create account, then restart from the same data folder: online, key unlocked, active
+  const dataDir = tmpDir('em-restart-');
+  const first = { autopilotPaused: true, keepAlive: { enabled: false }, cloud: { mode: 'auto', firebaseConfig: JSON.stringify(FB), emulator: EM, pcName: 'PC-R', verifyAfterRestore: false } };
+  const mk = isFirst => new UploadPilotApp({ dataDir, startApi: false, launcher: fakeLauncher(), ...(isFirst ? { settings: first } : {}), cloud: { activeOpts: { heartbeatMs: 1000, staleMs: 4000 } } });
+  const A = mk(true); await A.start({ api: false }); await A.cloudReady;
+  await A.cloud.signIn('restart' + email, 'secret123', { create: true });
+  assert.ok(A.cloud.keys.ready); assert.ok(A.cloud.activePc.isActive);
+  await A.updateSettings({ geminiKeys: 'AIza-em-key' });
+  await A.cloud.account.pushIfChanged();
+  await A.stop();
+  const B = mk(false); await B.start({ api: false }); const st = await B.cloudReady;   // a restart: no settings passed in, like the real app
+  assert.strictEqual(st.state, 'online', 'signed in again from the saved session');
+  assert.ok(st.keys.ready, 'account key from safeStorage, no password asked');
+  assert.ok(B.cloud.activePc.isActive, 'same PC: active again at once');
+  assert.deepStrictEqual(B.settings.get('geminiKeys'), ['AIza-em-key']);
+  await B.stop();
 });

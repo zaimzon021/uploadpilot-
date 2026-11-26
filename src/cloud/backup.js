@@ -60,6 +60,14 @@ class BackupWorker {
       ORDER BY CASE WHEN v.scheduled_at IS NULL THEN 1 ELSE 0 END, v.scheduled_at, v.id LIMIT 1`);
   }
 
+  /** Hand-over: back up one video now (ignores idle hours and the on/off switch; still one at a time). */
+  async backupOne(videoId) {
+    while (this.busy) await new Promise(r => setTimeout(r, 100));
+    const v = this.app.db.get(`SELECT v.*, c.name AS channel_name FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.id=? AND v.remote=0 AND v.drive_file_id IS NULL`, videoId);
+    if (!v || !this.cloud.drive()) return null;
+    return this._upload(v, { force: true });
+  }
+
   async tick() {
     if (this.busy || this.stopped) return null;
     const why = this.blockedReason();
@@ -67,6 +75,10 @@ class BackupWorker {
     if (why) return null;
     const v = this.nextVideo();
     if (!v) return null;
+    return this._upload(v, {});
+  }
+
+  async _upload(v, { force = false }) {
     if (!fs.existsSync(v.path)) { this.app.db.run('UPDATE videos SET backup_error=? WHERE id=?', 'file missing', v.id); return null; }
     this.busy = true; this.current = { videoId: v.id, sent: 0, size: v.size, filename: v.filename };
     const drive = this.cloud.drive();
@@ -84,7 +96,7 @@ class BackupWorker {
         chunkBytes: (c.chunkMB || 8) * 1024 * 1024,
         sessionUrl: job && job.session_url,
         onSession: url => this.app.db.run('INSERT OR REPLACE INTO drive_jobs(video_id,session_url,size,started_at) VALUES(?,?,?,?)', v.id, url, v.size, Date.now()),
-        shouldPause: () => !!this.blockedReason() && !this.stopped,
+        shouldPause: () => !force && !!this.blockedReason() && !this.stopped,
         signalFor: () => this.abortCtl.signal,
         onProgress: sent => {
           this.current.sent = sent;

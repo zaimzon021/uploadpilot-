@@ -31,7 +31,7 @@ function seed(app, { folder, files = ['x.mp4'], proxy = null }) {
   return ch;
 }
 
-test('hard limit: a run whose browser hangs is killed on time, video marked failed, profile closed', async () => {
+test('hard limit: a run whose browser hangs is killed on time, video set to retry automatically, profile closed', async () => {
   const app = new UploadPilotApp({ dataDir: tmpDir('cr-'), startApi: false, launcher: hangingLauncher(), settings: { upload: { channelHardLimitMs: 1500, stepTimeoutMs: 60000 } } });
   const ch = seed(app, { folder: tmpDir('crf-') });
   const t0 = Date.now();
@@ -39,8 +39,11 @@ test('hard limit: a run whose browser hangs is killed on time, video marked fail
   const took = Date.now() - t0;
   assert.strictEqual(r.result, 'hard_limit');
   assert.ok(took < 6000, `took ${took}`);
-  assert.strictEqual(app.db.get('SELECT status FROM videos').status, 'failed');
-  assert.match(app.db.get('SELECT error FROM videos').error, /Hard|limit/i);
+  const v = app.db.get('SELECT * FROM videos');
+  assert.strictEqual(v.status, 'ready', 'not given up: an automatic retry is planned');
+  assert.strictEqual(v.retry_count, 1);
+  assert.ok(v.retry_at > Date.now() + 3 * 60000, 'first retry about 5 min later');
+  assert.match(v.error, /Hard|limit/i);
   assert.strictEqual(app.profiles.isOpen(app.db.get('SELECT profile_id FROM channels').profile_id), false);
   assert.ok(fs.existsSync(path.join(r.runDir, 'run.log')));
   app.db.close();
@@ -69,12 +72,12 @@ test('missing file is marked missing, not uploaded', async () => {
   app.db.close();
 });
 
-test('AI worker: today\'s videos only, approval mode, failures retried then given up, manual title unblocks', async () => {
+test('AI worker (aiWriteAhead off = 0.3.0 rule): today\'s videos only, approval mode, failures retried then given up, manual title unblocks', async () => {
   let fail = false;
   const g = await startMockGemini({ respond: ({ n }) => (fail ? 'nope' : { title: `T${n}`, description: 'd', tags: ['a'], hashtags: ['#h'] }) });
   const folder = tmpDir('ai-');
   ['a.mp4', 'b.mp4', 'c.mp4'].forEach(f => fs.writeFileSync(path.join(folder, f), 'x'));
-  const app = new UploadPilotApp({ dataDir: tmpDir('ai-d-'), startApi: false, geminiPollMs: 1, geminiSleep: async () => {}, settings: { geminiKeys: ['k'], geminiBaseUrl: g.url, aiConcurrency: 5 } });
+  const app = new UploadPilotApp({ dataDir: tmpDir('ai-d-'), startApi: false, geminiPollMs: 1, geminiSleep: async () => {}, settings: { geminiKeys: ['k'], geminiBaseUrl: g.url, aiConcurrency: 5, aiWriteAhead: false, aiMinGapMs: 0 } });
   const ch = app.db.run(`INSERT INTO channels(name,folder,status,style,created_at) VALUES(?,?,?,?,?)`, 'AI', folder, 'active', JSON.stringify({ mode: 'approval' }), Date.now()).lastInsertRowid;
   app.ingest(ch);
   const vids = app.db.all('SELECT id FROM videos ORDER BY id');

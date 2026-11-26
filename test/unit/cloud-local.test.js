@@ -49,7 +49,10 @@ test('offline: never signed in -> no Firebase SDK, local app unchanged; "Use off
   const ch = app.db.run(`INSERT INTO channels(profile_id,name,folder,status,style,created_at) VALUES(?,?,?,?,?,?)`, prof.id, 'Local', folder, 'active', '{}', Date.now()).lastInsertRowid;
   assert.strictEqual(app.ingest(ch).added, 1);
   assert.ok(app.db.get('SELECT scheduled_at FROM videos').scheduled_at);
-  assert.strictEqual(app.runner.dueVideos(ch, Date.now() + 3 * 86400e3).length, 0, 'not ready yet (no title)');
+  // 0.3.1: auto mode -> a due video without AI metadata is still due (the runner writes it inline first)
+  assert.strictEqual(app.runner.dueVideos(ch, Date.now() + 3 * 86400e3).length, 1, 'due; metadata is written right before the upload');
+  app.db.run(`UPDATE channels SET style='{"mode":"approval"}' WHERE id=?`, ch);
+  assert.strictEqual(app.runner.dueVideos(ch, Date.now() + 3 * 86400e3).length, 0, 'approval mode: never uploaded before your OK');
   // Use offline
   const off = await app.cloud.useOffline();
   assert.strictEqual(off.state, 'offline');

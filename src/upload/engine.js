@@ -38,6 +38,17 @@ async function firstAttached(page, list) {
   return null;
 }
 
+/** Null-safe job: a missing title/description/tags can never crash the flow (0.3.1 "uploading null" fix). */
+function normalizeJob(job = {}) {
+  const { titleFromFilename } = require('./metadata');
+  const title = typeof job.title === 'string' && job.title.trim() ? job.title.trim() : titleFromFilename(job.filename || (job.file ? path.basename(job.file) : ''));
+  return {
+    ...job, title,
+    description: job.description == null ? '' : String(job.description),
+    tags: Array.isArray(job.tags) ? job.tags.filter(t => t != null && String(t).trim()).map(String) : [],
+  };
+}
+
 class UploadEngine {
   /**
    * @param {object} o
@@ -111,8 +122,8 @@ class UploadEngine {
     await human.pause(500, 1500);
     await human.replaceText(title, job.title);
     // read back: Studio can auto-complete @mentions or drop characters; fix with a direct insert once
-    const got = (await title.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
-    if (got !== job.title.replace(/\s+/g, ' ').trim()) {
+    const got = String((await title.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    if (got !== String(job.title || '').replace(/\s+/g, ' ').trim()) {
       this.log(`WARN title read-back mismatch ("${got.slice(0, 60)}"), re-inserting`);
       await title.click();
       await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
@@ -183,6 +194,7 @@ class UploadEngine {
    * Returns {url, finalText}.
    */
   async uploadVideo(page, job, { deadline }) {
+    job = normalizeJob(job);
     const human = new Human(page, { rng: this.rng, typing: this.cfg.typing, speed: this.speed });
     const st = { filesSet: false, detailsDone: false, visibilityDone: false, published: false, url: null, errors: 0 };
     let attempt = 0;
@@ -201,6 +213,36 @@ class UploadEngine {
         human.page = page;
       }
     }
+  }
+
+  /**
+   * Duplicate safety before a retry: look in Studio's content list (Videos tab) for a video with the same
+   * title or file name. Returns {checked, match?:{title, draft, url, videoId}, reason?}.
+   * Best effort: the content-list selectors are NOT verified against live Studio (see selectors.js).
+   */
+  async findExisting(page, { channelId, title, filename }) {
+    if (!channelId) return { checked: false, reason: 'channel id unknown' };
+    const url = `${this.studioUrl}/channel/${channelId}/videos/upload`;
+    try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.cfg.stepTimeoutMs }); }
+    catch (e) { if (!/ERR_ABORTED|detached/i.test(e.message)) return { checked: false, reason: e.message.split('\n')[0] }; }
+    const row = await firstVisible(page, SEL.content.row, { timeout: Math.min(15000, this.cfg.stepTimeoutMs) });
+    if (!row) return { checked: false, reason: 'content list not found' };
+    const rows = await page.evaluate(sel => {
+      const out = [];
+      for (const r of document.querySelectorAll(sel.row.join(','))) {
+        const t = r.querySelector(sel.title.join(','));
+        const a = r.querySelector(sel.link.join(','));
+        const txt = (r.innerText || '').toLowerCase();
+        out.push({ title: (t ? t.textContent : '').replace(/\s+/g, ' ').trim(), href: a ? a.getAttribute('href') : '', draft: sel.draftText.some(d => txt.includes(d)) });
+      }
+      return out;
+    }, { row: SEL.content.row, title: SEL.content.title, link: SEL.content.link, draftText: SEL.text.draft }).catch(() => []);
+    const norm = x => String(x || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const base = norm(String(filename || '').replace(/\.[a-z0-9]{2,5}$/i, ''));
+    const m = rows.find(r => norm(r.title) === norm(title) || (base && norm(r.title) === base));
+    if (!m) return { checked: true, match: null, rows: rows.length };
+    const id = (/\/video\/([\w-]{6,})/.exec(m.href || '') || [])[1] || null;
+    return { checked: true, match: { title: m.title, draft: m.draft, videoId: id, url: id ? `https://youtu.be/${id}` : null } };
   }
 
   /** Recovery ladder. attempt 1: dismiss dialogs/escape and continue; 2: reload; 3+: fresh tab. */
@@ -334,4 +376,4 @@ class UploadEngine {
   }
 }
 
-module.exports = { UploadEngine, NeedsUserError, UploadLimitError, StepTimeoutError, HardLimitError, FatalUploadError, firstVisible };
+module.exports = { normalizeJob, UploadEngine, NeedsUserError, UploadLimitError, StepTimeoutError, HardLimitError, FatalUploadError, firstVisible };
