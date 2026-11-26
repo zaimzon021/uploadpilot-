@@ -22,6 +22,8 @@ const DEFAULTS = {
     windowMode: 'minimized',                // autopilot windows: 'minimized' | 'offscreen' | 'normal'
     headless: false,
     extraArgs: [],
+    blockMedia: false,                      // block images/video/fonts in autopilot browsers (saves bandwidth; off by default for Studio)
+    snapshotEveryMin: 3,                    // manual/link windows: save the login to the cloud this often (only when it changed)
   },
   urls: {
     studio: 'https://studio.youtube.com',
@@ -43,6 +45,21 @@ const DEFAULTS = {
   schedulerTickMs: 30000,
   allowNoProxy: false,                      // link channels without a proxy (not recommended)
   autopilotPaused: false,                   // global pause switch
+  pauseWhenActive: { enabled: false, idleMinutes: 5 },   // don't START new jobs while the user is using the PC
+  geminiLowRes: { enabled: true, height: 360, videoKbps: 300, ffmpegPath: '' },   // small copy for Gemini (ffmpeg)
+  logRetentionDays: 14,
+  cloud: {
+    mode: 'auto',                           // 'auto' (sign in when a config exists) | 'cloud' | 'offline' (user picked "Use offline")
+    firebaseConfig: '',                     // web app config JSON from the Firebase console (or config/cloud-config.json)
+    googleClientId: '', googleClientSecret: '',   // OAuth Desktop client override; the secret itself is sealed in secrets.json (never stored here)
+    pcId: '', pcName: '', lastEmail: '',
+    emulator: { firestore: '', auth: '' },  // e.g. 127.0.0.1:8080 / http://127.0.0.1:9099 (development)
+    backup: { enabled: false, speedCapKBps: 0, speedCapPct: 30, measuredBps: 0, idleHours: { start: '01:00', end: '07:00' }, chunkMB: 8, deleteAfterUpload: true },
+    takeoverGraceMin: 120,                  // another PC may take over a backed-up video this long after its slot
+    leaseTtlSec: 120, leaseRenewSec: 30,
+    writeBudget: 18000,                     // soft daily cap: above it, activity/plan docs stop syncing (Spark: 20k writes/day)
+    driveUsage: {},
+  },
 };
 
 function deepMerge(base, over) {
@@ -75,7 +92,8 @@ class Settings {
   // Public view: hide secrets
   publicView() {
     const s = this.all();
-    return { ...s, geminiKeys: s.geminiKeys.map(k => k.slice(0, 6) + '…' + k.slice(-4)), geminiKeyCount: s.geminiKeys.length };
+    const cloud = { ...s.cloud, googleClientSecret: '' };
+    return { ...s, cloud, geminiKeys: s.geminiKeys.map(k => k.slice(0, 6) + '…' + k.slice(-4)), geminiKeyCount: s.geminiKeys.length };
   }
 }
 

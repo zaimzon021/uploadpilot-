@@ -68,9 +68,16 @@ async function render() {
     else if (state.page === 'settings') await renderSettings();
   } catch (e) { main.innerHTML = `<div class="card r">Could not load: ${esc(e.message)}</div>`; }
 }
+function cloudLine(c) {
+  if (!c) return '';
+  const map = { online: ['g', 'Synced'], connecting: ['y', 'Connecting'], signed_out: ['gr', 'Signed out'], offline: ['gr', 'Offline'], unconfigured: ['gr', 'Local only'], error: ['r', 'Error'] };
+  const [cls, l] = map[c.state] || ['gr', c.state];
+  return `<span class="pill ${cls}">${l}</span> <span class="muted small">${esc(c.state === 'online' ? (c.email || '') : 'this PC only')}</span><div class="muted small" style="margin-top:4px">${esc(c.pcName || '')}${c.pcs && c.pcs.length > 1 ? ` · ${c.pcs.length} PCs` : ''}</div>`;
+}
 async function refreshSide() {
   try {
     const d = await api('GET', '/dashboard');
+    const cl = document.getElementById('cloudLine'); if (cl) cl.innerHTML = cloudLine(d.cloud);
     document.getElementById('keysLine').innerHTML = `Gemini · ${d.ai.keys} key${d.ai.keys === 1 ? '' : 's'} <span class="pill ${d.ai.keys ? 'g' : 'r'}">${d.ai.keys ? 'OK' : 'Add keys'}</span>`;
     document.getElementById('keysCalls').textContent = `${d.ai.callsToday} calls today${d.ai.errorsToday ? ` · ${d.ai.errorsToday} errors` : ''}`;
     return d;
@@ -81,10 +88,10 @@ async function refreshSide() {
 function greeting() { const h = new Date().getHours(); return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'; }
 function feedItem(e) {
   const cls = { success: 'g', error: 'r', warn: 'y', info: 'b' }[e.level] || 'gr';
-  return `<div class="item"><span class="pill ${cls}">${new Date(e.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span> <span class="muted">${esc(e.message)}</span></div>`;
+  return `<div class="item"><span class="pill ${cls}">${new Date(e.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span> ${e.pc_name ? `<span class="pill gr">${esc(e.pc_name)}</span> ` : ''}<span class="muted">${esc(e.message)}</span></div>`;
 }
 function channelRows(chans, compact) {
-  if (!chans.length) return `<tr><td colspan="7" class="muted" style="padding:30px;text-align:center">No channels yet. Click <b>+ Link channel</b> to add your first one.</td></tr>`;
+  if (!chans.length) return `<tr><td colspan="9" class="muted" style="padding:30px;text-align:center">No channels yet. Click <b>+ Link channel</b> to add your first one.</td></tr>`;
   return chans.map(c => {
     const pct = c.planned_today ? Math.round(100 * c.done_today / c.planned_today) : 0;
     const next = c.status === 'needs_you' ? `<button class="btn link" data-relogin="${c.id}">Re-login ›</button>` : (c.status === 'active' ? fmtTime(c.next_upload) : '—');
@@ -93,7 +100,8 @@ function channelRows(chans, compact) {
       ${compact ? '' : `<td class="muted">#${c.profile_number ?? '—'}</td>`}
       <td class="muted">${esc(c.proxy || '—')}</td>
       <td><span class="bar"><i style="width:${pct}%"></i></span>${c.done_today}/${c.planned_today}</td>
-      <td>${c.queue}</td><td>${next}</td>
+      <td>${c.queue}</td><td>${next}${c.status === 'active' && c.next_video ? `<div class="muted small" title="${esc(c.next_video.title)}">${esc(String(c.next_video.title).slice(0, 34))}${c.next_video.from ? ' · from ' + esc(c.next_video.from) : ''}</div>` : ''}</td>
+      <td>${c.running_on ? `<span class="pill ${c.running_on.me ? 'b' : 'y'}">${c.running_on.me ? 'this PC' : esc(c.running_on.pcName)}</span>${c.running_on.state ? `<div class="muted small">${esc(c.running_on.state)}</div>` : ''}` : `<span class="muted small">${c.folder_pc_name ? 'files on ' + esc(c.folder_pc_name) : '—'}</span>`}</td>
       ${compact ? '' : `<td><div class="actions" onclick="event.stopPropagation()">
         <button class="btn ghost sm" data-open="${c.id}">Open profile</button>
         ${c.status === 'active' ? `<button class="btn ghost sm" data-stop="${c.id}">Stop</button>` : c.status !== 'linking' ? `<button class="btn sm" data-resume="${c.id}">Resume</button>` : ''}
@@ -112,7 +120,7 @@ async function renderDashboard() {
   const [d, chans, evs] = await Promise.all([refreshSide(), api('GET', '/channels'), api('GET', '/events?limit=40')]);
   state.events = evs;
   const nextIn = d.nextUpload ? Math.round((d.nextUpload - Date.now()) / 60000) : null;
-  const ap = d.autopilot.paused ? 'autopilot is paused' : !d.autopilot.inWindow ? `outside upload window (${d.autopilot.window.start}–${d.autopilot.window.end})` : 'autopilot is on';
+  const ap = d.autopilot.paused ? 'autopilot is paused' : d.autopilot.userActive ? 'waiting while you use the PC' : !d.autopilot.inWindow ? `outside upload window (${d.autopilot.window.start}–${d.autopilot.window.end})` : 'autopilot is on';
   const nd = d.needsYouDetail;
   const needParts = [nd.channels && `${nd.channels} login/verify`, nd.failed && `${nd.failed} failed`, nd.approval && `${nd.approval} to approve`].filter(Boolean).join(' · ') || 'all good';
   main.innerHTML = `
@@ -127,7 +135,7 @@ async function renderDashboard() {
   <div class="row">
     <div class="card" style="flex:2.3;min-width:0">
       <div class="head" style="margin-bottom:6px"><b>Channels</b><input id="search" placeholder="Search channels…" style="width:220px;padding:6px 10px"></div>
-      <table id="chTable"><thead><tr><th>Channel</th><th>Status</th><th>Proxy</th><th>Today</th><th>Queue</th><th>Next upload</th></tr></thead><tbody>${channelRows(chans, true)}</tbody></table>
+      <table id="chTable"><thead><tr><th>Channel</th><th>Status</th><th>Proxy</th><th>Uploaded today</th><th>Queue</th><th>Next video</th><th>PC</th></tr></thead><tbody>${channelRows(chans, true)}</tbody></table>
       <div class="muted" style="margin-top:10px">Showing ${chans.length} of ${chans.length}</div>
     </div>
     <div class="card" style="flex:1;min-width:280px"><b>Live activity</b><div class="feed" id="feed">${evs.map(feedItem).join('') || '<div class="muted">Nothing yet.</div>'}</div></div>
@@ -142,7 +150,7 @@ async function renderDashboard() {
 async function renderChannels() {
   const chans = await api('GET', '/channels');
   main.innerHTML = `<div class="head"><div><h1>Channels</h1><div class="sub">${chans.length} linked</div></div><button class="btn" id="linkBtn">+ Link channel</button></div>
-  <div class="card"><table><thead><tr><th>Channel</th><th>Status</th><th>Profile</th><th>Proxy</th><th>Today</th><th>Queue</th><th>Next upload</th><th></th></tr></thead><tbody>${channelRows(chans, false)}</tbody></table></div>`;
+  <div class="card"><table><thead><tr><th>Channel</th><th>Status</th><th>Profile</th><th>Proxy</th><th>Today</th><th>Queue</th><th>Next video</th><th>PC</th><th></th></tr></thead><tbody>${channelRows(chans, false)}</tbody></table></div>`;
   bindChannelRows(main);
   document.getElementById('linkBtn').onclick = () => openLink();
 }
@@ -208,7 +216,7 @@ async function renderChannel(id) {
 
 // ---------------------------------------------------------------- settings
 async function renderSettings() {
-  const s = await api('GET', '/settings');
+  const [s, cs] = await Promise.all([api('GET', '/settings'), api('GET', '/cloud/status')]);
   main.innerHTML = `<h1>Settings</h1><div class="sub">Changes apply immediately. Lanes / delays restart the scheduler between runs.</div>
   <div class="row">
     <div class="card" style="flex:1">
@@ -239,10 +247,17 @@ async function renderSettings() {
       <div class="grid2"><div class="field"><label>Autopilot windows</label><select id="wmode">${[['minimized', 'Minimized (default)'], ['offscreen', 'Off-screen'], ['normal', 'Normal']].map(([v, l]) => `<option value="${v}" ${s.browser.windowMode === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
         <div class="field"><label>Launch mode</label><select id="lmode">${[['persistent', 'Playwright persistent'], ['cdp', 'Spawn + CDP attach']].map(([v, l]) => `<option value="${v}" ${s.browser.launchMode === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
       <div class="field"><label>Local API token (optional; blank = none) · API on 127.0.0.1:${s.apiPort}</label><input id="tok" value="${esc(s.apiToken)}"></div>
+      <h2 style="margin-top:8px">Load</h2>
+      <div class="grid2">
+        <div class="field"><label><input type="checkbox" id="pwa" style="width:auto" ${s.pauseWhenActive.enabled ? 'checked' : ''}> Pause when I'm using the PC</label><input id="pwaMin" type="number" min="1" value="${s.pauseWhenActive.idleMinutes}" title="minutes without mouse/keyboard before new jobs start"></div>
+        <div class="field"><label><input type="checkbox" id="lowres" style="width:auto" ${s.geminiLowRes.enabled ? 'checked' : ''}> Small 360p copy for Gemini</label><label><input type="checkbox" id="blockMedia" style="width:auto" ${s.browser.blockMedia ? 'checked' : ''}> Block images/video in Studio (saves data; may hide previews)</label></div>
+      </div>
       <button class="btn" id="save">Save settings</button>
     </div>
-  </div>`;
+  </div>
+  ${cloudCard(s, cs)}`;
   const $ = id => document.getElementById(id);
+  bindCloudCard(s, cs);
   let savedProxyText = s.proxyPoolText;
   // Save the proxy pool textarea (masked lines keep their saved password). Runs on blur, after typing stops,
   // on Save settings and before Check all, so pasted proxies never need a separate Save click.
@@ -288,7 +303,10 @@ async function renderSettings() {
       upload: { visibility: $('vis').value, channelHardLimitMs: Math.max(5, +$('hard').value) * 60000 },
       browser: { executablePath: $('exe').value.trim(), windowMode: $('wmode').value, launchMode: $('lmode').value },
       apiToken: $('tok').value.trim(),
+      pauseWhenActive: { enabled: $('pwa').checked, idleMinutes: +$('pwaMin').value || 5 },
+      geminiLowRes: { ...s.geminiLowRes, enabled: $('lowres').checked },
     };
+    patch.browser.blockMedia = $('blockMedia').checked;
     if ($('keys').value.trim()) patch.geminiKeys = $('keys').value;
     await syncProxies();
     await api('PUT', '/settings', patch);
@@ -332,6 +350,85 @@ async function renderSettings() {
     } finally { btn.disabled = false; }
   };
 }
+
+
+// ---------------------------------------------------------------- cloud (v0.3)
+function fmtBytes(n) { return n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' : Math.round((n || 0) / 1e3) + ' KB'; }
+function cloudCard(s, cs) {
+  const c = s.cloud, b = c.backup;
+  const acct = cs.state === 'online'
+    ? `<div>Signed in as <b>${esc(cs.user.email)}</b> <span class="pill g">Synced</span> <button class="btn ghost sm" id="cSignOut">Sign out</button></div>`
+    : `<div><span class="pill gr">${cs.state === 'offline' ? 'Offline (local only)' : cs.state === 'unconfigured' ? 'Not configured' : 'Signed out'}</span> ${cs.configured ? '<button class="btn sm" id="cSignIn">Sign in</button>' : ''}</div>`;
+  const sync = cs.sync ? `<div class="muted small" style="margin-top:6px">Today: ${cs.quota.reads} reads · ${cs.quota.writes} writes (free plan: 50k / 20k) · ${cs.sync.pending} change(s) waiting${cs.sync.lastPushError ? ` · <span class="r-text">${esc(cs.sync.lastPushError)}</span>` : ''}</div>
+     <div class="muted small">PCs: ${cs.sync.pcs.map(p => esc(p.name) + (p.me ? ' (this PC)' : '')).join(', ') || '—'}${cs.leases.length ? ' · running: ' + cs.leases.map(l => `${esc(l.pcName)} ${esc(l.kind)}`).join(', ') : ''}</div>` : '';
+  const drive = cs.drive;
+  return `<div class="card" style="margin-top:16px" id="cloudCard">
+    <h2>Cloud</h2>
+    <div class="row">
+      <div style="flex:1">
+        <div class="field"><label>Account</label>${acct}${sync}</div>
+        <div class="field"><label>This PC's name (shown on the other PCs)</label><input id="cPcName" value="${esc(c.pcName)}"></div>
+        <div class="field"><label>Sync passphrase — the same on every PC; encrypts profile logins and proxy passwords ${cs.passphraseSet ? '<span class="pill g">set</span>' : '<span class="pill y">not set</span>'}</label>
+          <div style="display:flex;gap:8px"><input id="cPass" type="password" placeholder="${cs.passphraseSet ? '•••••••• (leave empty to keep)' : 'at least 8 characters'}"><button class="btn ghost" id="cPassSave">Save</button></div></div>
+        <div class="field"><label>Firebase config (JSON or the <code>firebaseConfig = {…}</code> snippet). Empty = ${cs.configSource === 'bundled default' || !c.firebaseConfig ? 'built-in project <b>' + esc(cs.projectId || '—') + '</b>' : 'built-in project'}</label><textarea id="cFb" style="min-height:70px" placeholder="built-in: ${esc(cs.projectId || '')}">${esc(c.firebaseConfig || '')}</textarea></div>
+      </div>
+      <div style="flex:1">
+        <div class="field"><label>Google Drive ${drive.connected ? `<span class="pill g">connected${drive.account ? ' · ' + esc(drive.account) : ''}</span>` : '<span class="pill gr">not connected</span>'}</label>
+          ${drive.connected ? '<button class="btn ghost" id="cDriveOff">Disconnect</button>' : '<button class="btn" id="cDriveOn">Connect Google Drive</button>'}
+          <div class="muted small" style="margin-top:6px">A browser opens: pick the Google account whose Drive should hold the backups and profile logins (it can be a different account from the sign-in above).</div></div>
+        <div class="grid2">
+          <div class="field"><label>OAuth client ID (empty = built-in)</label><input id="cCid" value="${esc(c.googleClientId || '')}" placeholder="${esc(drive.clientId || '')}"></div>
+          <div class="field"><label>OAuth client secret ${drive.secretSet ? `<span class="pill g">set · ${esc(drive.secretSource)}</span>` : '<span class="pill y">missing</span>'}</label><input id="cSecret" type="password" placeholder="${drive.secretSet ? 'leave empty to keep' : 'GOCSPX-…'}"></div>
+        </div>
+        <div class="field"><label><input type="checkbox" id="cBk" style="width:auto" ${b.enabled ? 'checked' : ''}> Back up videos to Drive (so another PC can take over a job)</label></div>
+        <div class="grid3">
+          <div class="field"><label>Speed cap KB/s (0 = 30% of measured)</label><input id="cCap" type="number" min="0" value="${b.speedCapKBps}"></div>
+          <div class="field"><label>Idle hours from</label><input id="cIdleS" type="time" value="${b.idleHours.start}"></div>
+          <div class="field"><label>to</label><input id="cIdleE" type="time" value="${b.idleHours.end}"></div>
+        </div>
+        ${cs.backup ? `<div class="muted small">Backup: ${cs.backup.busy ? 'uploading ' + esc(cs.backup.current?.filename || '') : esc(cs.backup.waiting || 'ready')} · ${cs.backup.pending} waiting · ${fmtBytes(drive.bytesToday)} today${b.measuredBps ? ` · measured ${Math.round(b.measuredBps / 1024)} KB/s` : ''}</div>` : ''}
+        <button class="btn" id="cSave" style="margin-top:10px">Save cloud settings</button>
+      </div>
+    </div></div>`;
+}
+function bindCloudCard(s, cs) {
+  const $ = id => document.getElementById(id);
+  if ($('cSignOut')) $('cSignOut').onclick = guard(async () => { await api('POST', '/cloud/signout'); toast('Signed out — this PC keeps working locally'); render(); });
+  if ($('cSignIn')) $('cSignIn').onclick = () => showSignIn(true);
+  $('cPassSave').onclick = guard(async () => { const v = $('cPass').value; if (!v) return; try { await api('POST', '/cloud/passphrase', { passphrase: v }); } catch (e) { if (/different/.test(e.message) && confirm(e.message + '\n\nUse this NEW passphrase anyway?')) await api('POST', '/cloud/passphrase', { passphrase: v, force: true }); else throw e; } toast('Sync passphrase saved'); render(); });
+  if ($('cDriveOn')) $('cDriveOn').onclick = guard(async () => { await api('POST', '/cloud/drive/connect'); toast('Finish in the browser window: choose the Google account for Drive'); });
+  if ($('cDriveOff')) $('cDriveOff').onclick = guard(async () => { await api('POST', '/cloud/drive/disconnect'); render(); });
+  $('cSave').onclick = guard(async () => {
+    const cloud = { pcName: $('cPcName').value.trim(), firebaseConfig: $('cFb').value.trim(), googleClientId: $('cCid').value.trim(),
+      backup: { enabled: $('cBk').checked, speedCapKBps: +$('cCap').value || 0, idleHours: { start: $('cIdleS').value, end: $('cIdleE').value } } };
+    if ($('cSecret').value.trim()) cloud.googleClientSecret = $('cSecret').value.trim();
+    await api('PUT', '/settings', { cloud });
+    toast('Cloud settings saved'); setTimeout(render, 600);
+  });
+}
+
+// ---------------------------------------------------------------- sign-in screen
+function showSignIn(fromSettings = false, st = null) {
+  modal.classList.remove('hidden');
+  modal.innerHTML = `<div class="card" style="width:420px">
+    <div class="logo" style="margin-bottom:14px"><div class="dot">▶</div>UploadPilot</div>
+    <h2>Sign in</h2><div class="muted" style="margin-bottom:16px">One account links all your PCs: channels, plans and uploads stay in sync, and a job never runs twice.</div>
+    <div class="field"><label>Email</label><input id="siEmail" type="email" value="${esc(st && st.lastEmail || '')}" autocomplete="username"></div>
+    <div class="field"><label>Password</label><input id="siPass" type="password" autocomplete="current-password"></div>
+    <div id="siErr" class="r-text small" style="min-height:16px;margin-bottom:8px"></div>
+    <div class="head"><div><button class="btn" id="siGo">Sign in</button> <button class="btn ghost" id="siNew">Create account</button></div><button class="btn link" id="siOff">${fromSettings ? 'Cancel' : 'Use offline'}</button></div>
+    <div class="muted small" style="margin-top:14px">Offline works exactly like before: everything stays on this PC. You can sign in later in Settings → Cloud.</div></div>`;
+  const $ = id => document.getElementById(id);
+  const go = create => async () => {
+    $('siErr').textContent = ''; $('siGo').disabled = $('siNew').disabled = true;
+    try { await api('POST', '/cloud/signin', { email: $('siEmail').value, password: $('siPass').value, create }); modal.classList.add('hidden'); toast('Signed in — syncing'); render(); }
+    catch (e) { $('siErr').textContent = e.message; } finally { $('siGo').disabled = $('siNew').disabled = false; }
+  };
+  $('siGo').onclick = go(false); $('siNew').onclick = go(true);
+  $('siPass').onkeydown = e => { if (e.key === 'Enter') go(false)(); };
+  $('siOff').onclick = guard(async () => { if (!fromSettings) await api('POST', '/cloud/offline'); modal.classList.add('hidden'); render(); });
+}
+window.__showSignIn = showSignIn;
 
 // ---------------------------------------------------------------- link wizard
 function openLink(preview = false) {
@@ -413,6 +510,8 @@ function connectEvents() {
     clearTimeout(connectEvents._t);
     connectEvents._t = setTimeout(() => { if (state.page === 'dashboard' || state.page === 'channels') render(); }, 1500);
   };
+  // another PC changed something (cloud listener) -> refresh the live views
+  es.addEventListener('cloud', () => { clearTimeout(connectEvents._c); connectEvents._c = setTimeout(() => { if (!state.link && (state.page === 'dashboard' || state.page === 'channels' || state.page === 'channel')) render(); else refreshSide(); }, 500); });
   es.onerror = () => { es.close(); setTimeout(connectEvents, 3000); };
 }
 
@@ -421,5 +520,10 @@ function connectEvents() {
   API = cfg.apiUrl; TOKEN = cfg.token;
   await render();
   connectEvents();
+  try {
+    let st = await api('GET', '/cloud/status');
+    for (let i = 0; i < 20 && st.state === 'connecting'; i++) { await new Promise(r => setTimeout(r, 500)); st = await api('GET', '/cloud/status'); }
+    if (st.configured && st.state === 'signed_out' && st.mode !== 'offline') showSignIn(false, st);
+  } catch (_) { /* local API not ready: stay local */ }
   setInterval(() => { if (!state.link && ['dashboard', 'channels'].includes(state.page)) render(); else refreshSide(); }, 30000);
 })();

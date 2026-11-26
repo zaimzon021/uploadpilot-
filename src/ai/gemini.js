@@ -214,9 +214,9 @@ class GeminiClient {
   }
 
   /** Full pipeline with key rotation and 429/5xx back-off. Files are per-key, so one attempt = one key end-to-end. */
-  async describeVideo(filePath, style = {}, { maxAttempts = 4 } = {}) {
+  async describeVideo(filePath, style = {}, { maxAttempts = 4, displayName = null } = {}) {
     if (!this.pool.size) throw new GeminiError('No Gemini API keys configured', 400);
-    const prompt = buildPrompt(style, path.basename(filePath));
+    const prompt = buildPrompt(style, displayName || path.basename(filePath));
     let lastErr;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let k = this.pool.next();

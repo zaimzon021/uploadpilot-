@@ -1,7 +1,7 @@
 'use strict';
 // Electron main process: hosts the UploadPilot core (autopilot + local API) and the UI window.
 // Closing the window hides it to the tray; autopilot keeps running until Quit.
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, shell, safeStorage, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { UploadPilotApp } = require('../src/core/app');
@@ -46,8 +46,14 @@ ipcMain.handle('pick-folder', async () => {
 ipcMain.handle('open-path', (_e, p) => shell.openPath(p));
 
 app.whenReady().then(async () => {
-  const dataDir = process.env.UPLOADPILOT_DATA || app.getPath('userData');
-  core = new UploadPilotApp({ dataDir, apiPort: SMOKE ? 0 : undefined });
+  const dataDir = process.env.UPLOADPILOT_DATA || (SMOKE ? fs.mkdtempSync(path.join(require('os').tmpdir(), 'up-smoke-')) : app.getPath('userData'));
+  core = new UploadPilotApp({
+    dataDir, apiPort: SMOKE ? 0 : undefined,
+    safeStorage,                                                     // secrets sealed with Windows DPAPI
+    openExternal: url => shell.openExternal(url),                    // Google Drive sign-in in the user's own browser
+    idleTimeProvider: () => powerMonitor.getSystemIdleTime(),        // "Pause when I'm using the PC"
+    resourcesPath: app.isPackaged ? process.resourcesPath : path.join(__dirname, '..'),
+  });
   try { await core.start(); }
   catch (e) {
     dialog.showErrorBox('UploadPilot could not start', `${e.message}\n\nIs another copy already running on port ${core.settings.get('apiPort')}?`);
@@ -69,6 +75,14 @@ async function runSmoke() {
     if (process.argv.includes('--seed')) { win.webContents.reload(); await new Promise(r => win.webContents.once('did-finish-load', r)); }
     step('renderer loaded', true);
     await new Promise(r => setTimeout(r, 2500));
+    // v0.3: the built-in cloud config means the sign-in screen shows first (never signed in here)
+    const signIn = await win.webContents.executeJavaScript('!!document.getElementById("siEmail")');
+    step('sign-in screen shown', signIn);
+    fs.writeFileSync(path.join(out, 'sign-in.png'), (await win.webContents.capturePage()).toPNG());
+    await win.webContents.executeJavaScript('document.getElementById("siOff") && document.getElementById("siOff").click()');
+    await new Promise(r => setTimeout(r, 1200));
+    const st = await fetch(core.api.url + '/cloud/status', { headers: { 'X-UploadPilot-Token': core.api.uiToken } }).then(r => r.json());
+    step('"Use offline" -> local mode', st.data.state === 'offline', st.data.state);
     const title = await win.webContents.executeJavaScript('document.querySelector("h1") && document.querySelector("h1").textContent');
     step('dashboard rendered', !!title, title);
     const stats = await win.webContents.executeJavaScript('[...document.querySelectorAll(".stat .num")].map(e=>e.textContent).join(",")');

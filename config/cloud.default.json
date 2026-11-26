@@ -1,0 +1,14 @@
+{
+  "_comment": "Default UploadPilot cloud config (bundled). Overridable in Settings > Cloud. The OAuth client secret is NOT stored here: it comes from Settings > Cloud (sealed with safeStorage), env UPLOADPILOT_OAUTH_CLIENT_SECRET, or config/cloud.secret.json written by CI from the OAUTH_CLIENT_SECRET secret.",
+  "firebase": {
+    "apiKey": "AIzaSyBVgp8bMN27njLP4HNfZ8-eF0Qnfql69rg",
+    "authDomain": "uploadpilot-2c754.firebaseapp.com",
+    "projectId": "uploadpilot-2c754",
+    "storageBucket": "uploadpilot-2c754.firebasestorage.app",
+    "messagingSenderId": "1069754724778",
+    "appId": "1:1069754724778:web:6e5dc4a0f46e7fd916fbd3"
+  },
+  "google": {
+    "clientId": "1069754724778-jpeae9uavnv348dpknso5v7e8ds8j8m1.apps.googleusercontent.com"
+  }
+}

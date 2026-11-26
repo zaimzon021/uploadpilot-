@@ -29,6 +29,18 @@ jobs:
           if (-not $exe) { throw "chrome.exe not found under browsers/" }
           "Bundled chrome.exe: $($exe.FullName) ($([math]::Round($exe.Length/1MB,1)) MB)"
           "browsers folder total: $([math]::Round(((Get-ChildItem browsers -Recurse -File | Measure-Object Length -Sum).Sum)/1MB,1)) MB"
+      # Optional: bake the Google OAuth client secret into the packaged config (repo secret OAUTH_CLIENT_SECRET).
+      # Skip-safe: without the secret nothing is written and users paste it in Settings > Cloud instead.
+      - name: Inject OAuth client secret (optional)
+        run: node scripts/inject-oauth-secret.js
+        env:
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+      - name: Check bundled ffmpeg (ffmpeg-static)
+        shell: pwsh
+        run: |
+          $ff = "node_modules/ffmpeg-static/ffmpeg.exe"
+          if (-not (Test-Path $ff)) { throw "ffmpeg-static did not download ffmpeg.exe" }
+          "ffmpeg.exe: $([math]::Round((Get-Item $ff).Length/1MB,1)) MB"
       - name: Build installer
         run: npm run build
         env:
@@ -40,6 +52,9 @@ jobs:
           if (-not $exe) { throw "Bundled chrome.exe missing from dist/win-unpacked/resources/browsers" }
           "Packaged: $($exe.FullName)"
           Get-ChildItem dist/win-unpacked/resources/browsers
+          if (-not (Test-Path dist/win-unpacked/resources/ffmpeg/ffmpeg.exe)) { throw "ffmpeg.exe missing from resources/ffmpeg" }
+          if (-not (Test-Path dist/win-unpacked/resources/config/cloud.default.json)) { throw "cloud.default.json missing from resources/config" }
+          "OAuth secret bundled: $(Test-Path dist/win-unpacked/resources/config/cloud.secret.json)"
           Get-ChildItem dist/*.exe | ForEach-Object { "Installer: $($_.Name) $([math]::Round($_.Length/1MB,1)) MB" }
       - uses: actions/upload-artifact@v4
         with:

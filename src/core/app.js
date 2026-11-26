@@ -7,7 +7,7 @@ const { DB } = require('./db');
 const { Settings } = require('./settings');
 const { Events } = require('./events');
 const { ProfileManager } = require('../profiles/profileManager');
-const { scanFolder, findThumb } = require('../autopilot/scanner');
+const { scanFolder, findThumb, moveToDone } = require('../autopilot/scanner');
 const { watchFolder } = require('../autopilot/watcher');
 const { buildPlan } = require('../autopilot/planner');
 const { LaneScheduler } = require('../autopilot/laneScheduler');
@@ -16,6 +16,9 @@ const { ChannelRunner } = require('../upload/channelRunner');
 const { LinkWizard, normalizeStyle } = require('../wizard/linkWizard');
 const { startOfDay, addDays, inWindow, dayKey } = require('../util/time');
 const { proxyLabel } = require('../proxy/parse');
+const { CloudService } = require('../cloud');
+const { makeLowRes } = require('../ai/lowres');
+const { rotateLogs } = require('../util/logRotate');
 
 class UploadPilotApp {
   /**
@@ -26,6 +29,10 @@ class UploadPilotApp {
    * @param {Function} [o.fetchImpl]     fetch used by Gemini (tests)
    * @param {object} [o.engineOpts]      upload engine options e.g. {speed}
    * @param {boolean} [o.startApi=true]
+   * @param {object} [o.safeStorage]      Electron safeStorage (secrets sealed with Windows DPAPI)
+   * @param {(url:string)=>any} [o.openExternal]   system browser (Google Drive sign-in)
+   * @param {() => number} [o.idleTimeProvider]    seconds since the user last touched mouse/keyboard (Electron powerMonitor)
+   * @param {object} [o.cloud]            CloudService options for tests: {storeFactory, fetchImpl, driveBaseUrl, googleEndpoints, leaseOpts, syncOpts}
    */
   constructor(o) {
     this.o = o;
@@ -37,7 +44,14 @@ class UploadPilotApp {
     if (o.settings) this.settings.set(o.settings);
     this.events = new Events(this.db, this.logsDir);
     this.profiles = new ProfileManager({ db: this.db, settings: this.settings, events: this.events, dataDir: this.dataDir, launcher: o.launcher, proxyChecker: o.proxyChecker });
-    this.runner = new ChannelRunner({ db: this.db, settings: this.settings, events: this.events, profiles: this.profiles, logsDir: this.logsDir, engineOpts: o.engineOpts || {} });
+    this.cloud = new CloudService({ app: this, safeStorage: o.safeStorage, openExternal: o.openExternal, resourcesPath: o.resourcesPath, ...(o.cloud || {}) });
+    this.runner = new ChannelRunner({ db: this.db, settings: this.settings, events: this.events, profiles: this.profiles, logsDir: this.logsDir, engineOpts: o.engineOpts || {}, cloud: this.cloud });
+    this.profiles.hooks = {
+      beforeOpen: (prof, purpose) => this.cloud.beforeOpenProfile(prof, purpose),
+      afterLaunch: (prof, sess) => this.cloud.afterLaunchProfile(prof, sess),
+      beforeClose: (prof, sess) => this.cloud.beforeCloseProfile(prof, sess),
+      afterClose: prof => this.cloud.afterCloseProfile(prof),
+    };
     this.wizard = new LinkWizard(this);
     this.watchers = new Map();
     this.aiBusy = new Set(); this.aiNextTry = new Map();
@@ -48,9 +62,14 @@ class UploadPilotApp {
   async start({ api = this.o.startApi !== false } = {}) {
     if (this.started) return;
     this.started = true;
-    // crash recovery: anything left "uploading"/"ai" from a previous session goes back to its queue
-    this.db.run(`UPDATE videos SET status='ready' WHERE status='uploading'`);
-    this.db.run(`UPDATE videos SET status='queued', ai_status='pending' WHERE status='ai'`);
+    // crash recovery: anything this PC left "uploading"/"ai" goes back to its queue
+    // (cloud copies of other PCs' videos are left alone: their own PC or a lease expiry handles them)
+    this.db.run(`UPDATE videos SET status='ready' WHERE status='uploading' AND remote=0`);
+    this.db.run(`UPDATE videos SET status='queued', ai_status='pending' WHERE status='ai' AND remote=0`);
+    this.cacheDir = path.join(this.dataDir, 'cache');
+    this._rotate();
+    this._rotateTimer = setInterval(() => this._rotate(), 6 * 3600e3);
+    if (this._rotateTimer.unref) this._rotateTimer.unref();
     this.db.run(`UPDATE runs SET result='interrupted', ended_at=? WHERE result='running'`, Date.now());
     if (api) {
       const { startApiServer } = require('../api/server');
@@ -65,6 +84,29 @@ class UploadPilotApp {
     this._planTimer = setInterval(() => this.replanAll(), 15 * 60000);
     setTimeout(() => this.aiTick().catch(() => {}), 500);
     this.events.info(`UploadPilot started (db: ${this.db.driver})`, { kind: 'app' });
+    // cloud sign-in / sync starts in the background; the app works locally meanwhile
+    this.cloudReady = this.cloud.start().then(st => { if (this.scheduler) this.scheduler.wake(); return st; })
+      .catch(e => { this.events.error(`Cloud: ${e.message}`, { kind: 'cloud' }); return this.cloud.status(); });
+    this.cloud.on('change', () => this.events.emit('cloud', { ts: Date.now() }));
+  }
+
+  _rotate() {
+    try { rotateLogs({ logsDir: this.logsDir, db: this.db, days: this.settings.get('logRetentionDays') || 14, cacheDir: this.cacheDir }); } catch (_) { /* never fatal */ }
+  }
+
+  /** "Pause when I'm using the PC": true while the user touched mouse/keyboard in the last N minutes. */
+  userActive() {
+    const p = this.settings.get('pauseWhenActive');
+    if (!p || !p.enabled || !this.o.idleTimeProvider) return false;
+    let idleSec = 0; try { idleSec = this.o.idleTimeProvider(); } catch (_) { return false; }
+    return idleSec < (p.idleMinutes || 5) * 60;
+  }
+
+  /** Another PC published a video whose file lives here: move it into Done/ like a local upload. */
+  onRemoteDone(videoId) {
+    const v = this.db.get('SELECT * FROM videos WHERE id=?', videoId);
+    if (!v || v.remote || !this.settings.get('upload').moveDoneFiles || !fs.existsSync(v.path)) return;
+    try { const m = moveToDone(v.path, v.thumb); this.db.applying(() => this.db.run('UPDATE videos SET path=?, thumb=? WHERE id=?', m.video || v.path, m.thumb || v.thumb, v.id)); this.events.info(`${v.filename} was published by another PC — moved to Done`, { channelId: v.channel_id, kind: 'scan' }); } catch (_) { /* ignore */ }
   }
 
   _buildScheduler() {
@@ -76,6 +118,7 @@ class UploadPilotApp {
       cooldownMs: this.o.cooldownMs ?? 10 * 60000,
       getAllChannels: () => this.db.all(`SELECT id FROM channels WHERE status='active'`).map(r => r.id),
       getDueChannels: () => this.dueChannelIds(),
+      canStart: () => !this.userActive(),
       runChannel: (id, lane) => this.runner.run(id, lane),
       onEvent: ev => { if (ev.type === 'wait') this.events.info(`Lane ${ev.lane + 1}: waiting ${Math.round(ev.ms / 1000)}s before next channel`, { kind: 'lane' }); if (ev.type === 'error') this.events.error(`Lane ${ev.lane + 1}: ${ev.error}`, { channelId: ev.channelId, kind: 'lane' }); },
     });
@@ -88,12 +131,14 @@ class UploadPilotApp {
   }
 
   async stop() {
-    clearInterval(this._aiTimer); clearInterval(this._planTimer);
+    clearInterval(this._aiTimer); clearInterval(this._planTimer); clearInterval(this._rotateTimer);
     if (this.scheduler) await this.scheduler.stop();
     for (const w of this.watchers.values()) await w.close();
     this.watchers.clear();
     await this.wizard.closeAll();
     await this.profiles.closeAll();
+    if (this.cloudReady) await this.cloudReady.catch(() => {});
+    await this.cloud.stop().catch(() => {});
     if (this.api) await this.api.close();
     this.db.close();
     this.started = false;
@@ -103,10 +148,17 @@ class UploadPilotApp {
   dueChannelIds(now = Date.now()) {
     const s = this.settings.all();
     if (s.autopilotPaused || !inWindow(now, s.uploadWindow)) return [];
-    return this.db.all(`SELECT DISTINCT c.id, c.profile_id FROM channels c JOIN videos v ON v.channel_id=c.id
-      WHERE c.status='active' AND (c.paused_until IS NULL OR c.paused_until<=?) AND v.status='ready' AND v.scheduled_at<=?`, now, now)
-      .filter(r => !(this.profiles.isOpen(r.profile_id) && this.profiles.session(r.profile_id).purpose !== 'auto'))
-      .map(r => r.id);
+    const rows = this.db.all(`SELECT c.id AS cid, c.profile_id, v.* FROM channels c JOIN videos v ON v.channel_id=c.id
+      WHERE c.status='active' AND (c.paused_until IS NULL OR c.paused_until<=?) AND v.status='ready' AND v.scheduled_at<=?`, now, now);
+    const ids = new Set();
+    for (const r of rows) {
+      if (ids.has(r.cid)) continue;
+      if (this.profiles.isOpen(r.profile_id) && this.profiles.session(r.profile_id).purpose !== 'auto') continue;
+      if (r.remote && !this.cloud.runnableHere(r, now)) continue;                    // file is on another PC
+      if (this.cloud.online && this.cloud.holderName(`profile_${this.db.get('SELECT cloud_id FROM profiles WHERE id=?', r.profile_id)?.cloud_id}`)?.me === false) continue; // profile open elsewhere
+      ids.add(r.cid);
+    }
+    return [...ids];
   }
 
   /** Scan the channel folder, add new videos, then plan. */
@@ -140,7 +192,8 @@ class UploadPilotApp {
     if (!ch?.folder) return;
     const w = watchFolder(ch.folder, {
       stabilityMs: this.o.watchStabilityMs ?? 3000,
-      usePolling: !!this.o.watchPolling,
+      usePolling: !!this.o.watchPolling,               // native OS events; polling only for tests on odd filesystems
+      pollInterval: this.o.watchPollInterval ?? 1000,  // awaitWriteFinish size checks of a file still being copied
       onVideo: p => this.addVideoFile(channelId, p),
       onThumb: p => {
         const base = path.basename(p, path.extname(p)).toLowerCase();
@@ -157,7 +210,7 @@ class UploadPilotApp {
     const ch = this.db.get('SELECT * FROM channels WHERE id=?', channelId);
     const style = JSON.parse(ch?.style || '{}');
     const perDay = style.perDay || s.videosPerDay;
-    const unscheduled = this.db.all(`SELECT id, filename FROM videos WHERE channel_id=? AND scheduled_at IS NULL AND status IN ('queued','ready','awaiting_approval') ORDER BY id`, channelId);
+    const unscheduled = this.db.all(`SELECT id, filename FROM videos WHERE channel_id=? AND scheduled_at IS NULL AND remote=0 AND status IN ('queued','ready','awaiting_approval') ORDER BY id`, channelId);
     if (!unscheduled.length) return [];
     const { naturalCmp } = require('../autopilot/scanner');
     unscheduled.sort((a, b) => naturalCmp(a.filename, b.filename));
@@ -184,11 +237,12 @@ class UploadPilotApp {
   async aiTick(now = Date.now()) {
     const s = this.settings.all();
     if (!s.geminiKeys.length) return 0;
+    if (this.userActive()) return 0;
     const until = startOfDay(addDays(now, 1 + (s.aiLookaheadDays || 0)));
     const free = (s.aiConcurrency || 2) - this.aiBusy.size;
     if (free <= 0) return 0;
     const rows = this.db.all(`SELECT v.*, c.style, c.name AS channel_name FROM videos v JOIN channels c ON c.id=v.channel_id
-      WHERE v.status='queued' AND v.ai_status IN ('pending','retry') AND v.scheduled_at IS NOT NULL AND v.scheduled_at<? AND c.status IN ('active','paused','needs_you')
+      WHERE v.status='queued' AND v.remote=0 AND v.ai_status IN ('pending','retry') AND v.scheduled_at IS NOT NULL AND v.scheduled_at<? AND c.status IN ('active','paused','needs_you')
       ORDER BY v.scheduled_at LIMIT ?`, until, 50).filter(v => !this.aiBusy.has(v.id) && !((this.aiNextTry.get(v.id) || 0) > now)).slice(0, free);
     const client = this.geminiClient();
     await Promise.all(rows.map(v => this._aiOne(client, v)));
@@ -199,8 +253,16 @@ class UploadPilotApp {
     this.aiBusy.add(v.id);
     this.db.run(`UPDATE videos SET status='ai', ai_status='running' WHERE id=? AND status='queued'`, v.id);
     const style = JSON.parse(v.style || '{}');
+    let low = null;
     try {
-      const meta = await client.describeVideo(v.path, style, { maxAttempts: this.settings.get('geminiMaxAttempts') });
+      // low-bandwidth: send Gemini a 360p copy (ffmpeg, idle priority, one at a time); original if that fails
+      const lr = this.settings.get('geminiLowRes');
+      let src = v.path;
+      if (lr && lr.enabled) {
+        low = await makeLowRes(v.path, { outDir: path.join(this.dataDir, 'cache', 'lowres'), height: lr.height, videoKbps: lr.videoKbps, configured: lr.ffmpegPath || '' });
+        if (low.lowres) src = low.path; else if (low.reason && !this._lowresWarned) { this._lowresWarned = true; this.events.warn(`Low-bandwidth copy for Gemini not made (${low.reason}) — sending the original`, { kind: 'ai' }); }
+      }
+      const meta = await client.describeVideo(src, style, { maxAttempts: this.settings.get('geminiMaxAttempts'), displayName: v.filename });
       const cur = this.db.get('SELECT * FROM videos WHERE id=?', v.id);
       const next = style.mode === 'approval' ? 'awaiting_approval' : 'ready';
       if (cur.edited) this.db.run(`UPDATE videos SET status=?, ai_status='done' WHERE id=?`, next, v.id);
@@ -212,7 +274,10 @@ class UploadPilotApp {
       this.db.run(`UPDATE videos SET status='queued', ai_status=?, ai_error=?, ai_attempts=? WHERE id=?`, final ? 'failed' : 'retry', e.message.slice(0, 500), attempts, v.id);
       this.aiNextTry.set(v.id, Date.now() + 10 * 60000 * attempts);
       this.events.error(`${v.channel_name}: AI failed for ${v.filename}${final ? ' (gave up — edit the title by hand)' : ', will retry'}: ${e.message.split('\n')[0]}`, { channelId: v.channel_id, kind: 'ai' });
-    } finally { this.aiBusy.delete(v.id); }
+    } finally {
+      this.aiBusy.delete(v.id);
+      if (low && low.lowres) { try { fs.unlinkSync(low.path); } catch (_) { /* gone */ } }
+    }
   }
 
   async activateChannel(channelId) {
@@ -233,7 +298,19 @@ class UploadPilotApp {
       (SELECT COUNT(*) FROM videos v WHERE v.channel_id=c.id AND v.status='failed') AS failed,
       (SELECT MIN(v.scheduled_at) FROM videos v WHERE v.channel_id=c.id AND v.status IN ('queued','ai','awaiting_approval','ready')) AS next_upload
       FROM channels c LEFT JOIN profiles f ON f.id=c.profile_id LEFT JOIN proxies p ON p.id=f.proxy_id ORDER BY c.id`, today, today, tomorrow)
-      .map(c => ({ ...c, style: JSON.parse(c.style || '{}'), proxy: c.proxy_host ? `${c.proxy_host}:${c.proxy_port}` : null, live: this.runner.live.get(c.id) || null, profile_open: c.profile_id ? this.profiles.isOpen(c.profile_id) : false }));
+      .map(c => {
+        const nextV = this.db.get(`SELECT id, title, filename, scheduled_at, remote, origin_pc_name FROM videos WHERE channel_id=? AND status IN ('queued','ai','awaiting_approval','ready') AND scheduled_at IS NOT NULL ORDER BY scheduled_at LIMIT 1`, c.id);
+        const pc = c.profile_id ? this.db.get('SELECT cloud_id FROM profiles WHERE id=?', c.profile_id) : null;
+        let holder = this.cloud.online && pc && pc.cloud_id ? this.cloud.holderName(`profile_${pc.cloud_id}`) : null;
+        if (!holder && this.cloud.online && c.cloud_id) { const l = this.cloud.leases.active().find(x => x.kind === 'video' && x.channelId === c.cloud_id); if (l) holder = { pcName: l.pcName, me: l.pcId === this.cloud.pcId, state: l.state || 'uploading' }; }
+        const live = this.runner.live.get(c.id) || null;
+        return {
+          ...c, style: JSON.parse(c.style || '{}'), proxy: c.proxy_host ? `${c.proxy_host}:${c.proxy_port}` : null, live, profile_open: c.profile_id ? this.profiles.isOpen(c.profile_id) : false,
+          next_video: nextV ? { id: nextV.id, title: nextV.title || nextV.filename, at: nextV.scheduled_at, from: nextV.remote ? nextV.origin_pc_name : null } : null,
+          running_on: live ? { pcName: this.cloud.pcName, me: true, state: live.state } : holder ? { pcName: holder.pcName, me: holder.me, state: holder.state } : null,
+          folder_pc_name: c.folder_pc && c.folder_pc !== this.cloud.pcId ? c.folder_pc_name : null,
+        };
+      });
   }
   getChannel(id) { return this.listChannels().find(c => c.id === +id) || null; }
   channelStatus(id) {
@@ -249,7 +326,7 @@ class UploadPilotApp {
   resumeChannel(id) {
     const ch = this.db.get('SELECT * FROM channels WHERE id=?', id);
     if (!ch) return null;
-    if (!ch.folder) throw Object.assign(new Error('Channel has no folder yet — finish linking'), { status: 409 });
+    if (!ch.folder && !(ch.folder_pc && ch.folder_pc !== this.cloud.pcId)) throw Object.assign(new Error('Channel has no folder yet — finish linking'), { status: 409 });
     this.db.run(`UPDATE channels SET status='active', status_reason=NULL, paused_until=NULL WHERE id=?`, id);
     this.events.info(`Channel ${ch.name || id} resumed`, { channelId: +id, kind: 'channel' });
     this.activateChannel(+id);
@@ -333,7 +410,8 @@ class UploadPilotApp {
       needsYou: chans.filter(c => c.status === 'needs_you').length + this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status IN ('failed','awaiting_approval')`).n,
       needsYouDetail: { channels: chans.filter(c => c.status === 'needs_you').length, failed: this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status='failed'`).n, approval: this.db.get(`SELECT COUNT(*) AS n FROM videos WHERE status='awaiting_approval'`).n },
       nextUpload: nextRow?.t || null,
-      autopilot: { paused: !!s.autopilotPaused, inWindow: inWindow(Date.now(), s.uploadWindow), window: s.uploadWindow, lanes: this.scheduler ? this.scheduler.status().lanes : [] },
+      autopilot: { paused: !!s.autopilotPaused, userActive: this.userActive(), inWindow: inWindow(Date.now(), s.uploadWindow), window: s.uploadWindow, lanes: this.scheduler ? this.scheduler.status().lanes : [] },
+      cloud: { state: this.cloud.state, email: this.cloud.user ? this.cloud.user.email : null, pcName: this.cloud.pcName, pcs: this.cloud.sync ? this.cloud.sync.status().pcs : [] },
       ai: { keys: s.geminiKeys.length, model: s.geminiModel, callsToday: usage.calls, errorsToday: usage.errors },
       proxies: { total: this.db.get('SELECT COUNT(*) AS n FROM proxies').n, bad: this.db.get(`SELECT COUNT(*) AS n FROM proxies WHERE status='bad'`).n },
     };
@@ -353,8 +431,30 @@ class UploadPilotApp {
     if (patch.lanes !== undefined) patch.lanes = Math.max(1, Math.min(20, +patch.lanes || 1));
     if (patch.videosPerDay !== undefined) patch.videosPerDay = Math.max(1, Math.min(50, +patch.videosPerDay || 1));
     if (patch.uploadWindow) { const { parseHHMM } = require('../util/time'); if (parseHHMM(patch.uploadWindow.end) <= parseHHMM(patch.uploadWindow.start)) throw Object.assign(new Error('Upload window end must be after start'), { status: 400 }); }
+    if (patch.cloud) {
+      const cur = this.settings.get('cloud');
+      const c = { ...cur, ...patch.cloud };
+      if (patch.cloud.backup) c.backup = { ...cur.backup, ...patch.cloud.backup, idleHours: { ...cur.backup.idleHours, ...(patch.cloud.backup.idleHours || {}) } };
+      // the OAuth client secret never stays in plain settings: it is sealed with safeStorage
+      if (typeof patch.cloud.googleClientSecret === 'string' && patch.cloud.googleClientSecret.trim() && !patch.cloud.googleClientSecret.startsWith('••••')) this.cloud.setClientSecret(patch.cloud.googleClientSecret);
+      if (patch.cloud.clearClientSecret) this.cloud.setClientSecret('');
+      delete c.clearClientSecret;
+      c.googleClientSecret = '';
+      if (c.backup) { c.backup.speedCapKBps = Math.max(0, +c.backup.speedCapKBps || 0); c.backup.speedCapPct = Math.max(1, Math.min(100, +c.backup.speedCapPct || 30)); const { parseHHMM } = require('../util/time'); parseHHMM(c.backup.idleHours.start); parseHHMM(c.backup.idleHours.end); }
+      if (patch.cloud.firebaseConfig !== undefined && typeof patch.cloud.firebaseConfig === 'string' && patch.cloud.firebaseConfig.trim()) {
+        const { parseMaybeJson } = require('../cloud');
+        const fb = parseMaybeJson(patch.cloud.firebaseConfig);
+        if (!fb || !fb.apiKey || !fb.projectId) throw Object.assign(new Error('Firebase config must be the JSON (or firebaseConfig = {...} snippet) from the Firebase console with apiKey, projectId and appId'), { status: 400 });
+        c.firebaseConfig = JSON.stringify(fb);
+      }
+      if (typeof c.pcName === 'string') c.pcName = c.pcName.trim().slice(0, 40) || cur.pcName;
+      patch.cloud = c;
+    }
+    if (patch.pauseWhenActive) patch.pauseWhenActive = { enabled: !!patch.pauseWhenActive.enabled, idleMinutes: Math.max(1, Math.min(120, +patch.pauseWhenActive.idleMinutes || 5)) };
     if (patch.delayRangeMin) { const a = +patch.delayRangeMin.min, b = +patch.delayRangeMin.max; if (!(a >= 0 && b >= a)) throw Object.assign(new Error('Delay range invalid'), { status: 400 }); patch.delayRangeMin = { min: a, max: b }; }
+    const cloudKeysChanged = patch.cloud && ['firebaseConfig', 'googleClientId', 'emulator'].some(k => JSON.stringify(before.cloud[k]) !== JSON.stringify(patch.cloud[k]));
     const after = this.settings.set(patch);
+    if (this.started && cloudKeysChanged) this.cloudReady = this.cloud.reconnect().catch(e => { this.events.error(`Cloud: ${e.message}`, { kind: 'cloud' }); });
     if (this.started && (before.lanes !== after.lanes || JSON.stringify(before.delayRangeMin) !== JSON.stringify(after.delayRangeMin))) await this.restartScheduler();
     if (JSON.stringify(before.uploadWindow) !== JSON.stringify(after.uploadWindow) || before.videosPerDay !== after.videosPerDay) {
       // re-spread future, not-yet-uploaded slots

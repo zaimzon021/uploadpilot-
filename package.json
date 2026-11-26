@@ -1,8 +1,8 @@
 {
   "name": "uploadpilot",
   "productName": "UploadPilot",
-  "version": "0.2.0",
-  "description": "Auto-upload videos to many YouTube channels through YouTube Studio in isolated browser profiles",
+  "version": "0.3.0",
+  "description": "Auto-upload videos to many YouTube channels through YouTube Studio in isolated browser profiles, synced across PCs",
   "main": "electron/main.js",
   "author": "UploadPilot",
   "license": "UNLICENSED",
@@ -17,7 +17,9 @@
     "build": "electron-builder --win nsis --x64 --publish never",
     "build:dir": "electron-builder --dir",
     "build:win-dir": "electron-builder --win --x64 --dir",
-    "browsers:install": "node scripts/install-browser.js"
+    "browsers:install": "node scripts/install-browser.js",
+    "test:emulator": "firebase emulators:exec --project demo-uploadpilot --only auth,firestore \"node --test --test-concurrency=1 test/emulator/firestore-emulator.test.js\"",
+    "inject:secret": "node scripts/inject-oauth-secret.js"
   },
   "build": {
     "appId": "com.uploadpilot.app",
@@ -31,7 +33,9 @@
       "src/**",
       "renderer/**",
       "package.json",
-      "!test/**"
+      "!test/**",
+      "!node_modules/ffmpeg-static/ffmpeg",
+      "!node_modules/ffmpeg-static/ffmpeg.exe"
     ],
     "asarUnpack": [
       "node_modules/better-sqlite3/prebuilds/**"
@@ -68,12 +72,31 @@
           "chromium-*/**",
           "!chromium-headless-shell-*/**"
         ]
+      },
+      {
+        "from": "config",
+        "to": "config",
+        "filter": [
+          "cloud.default.json",
+          "cloud.secret.json"
+        ]
+      },
+      {
+        "from": "node_modules/ffmpeg-static",
+        "to": "ffmpeg",
+        "filter": [
+          "ffmpeg",
+          "ffmpeg.exe",
+          "LICENSE*"
+        ]
       }
     ]
   },
   "dependencies": {
     "better-sqlite3": "^13.2.0",
     "chokidar": "^3.6.0",
+    "ffmpeg-static": "^5.3.0",
+    "firebase": "^12.19.0",
     "playwright-core": "1.65",
     "socks": "^2.8.11"
   },

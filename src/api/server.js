@@ -18,9 +18,24 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
   const int = v => { const n = parseInt(v, 10); if (!Number.isFinite(n)) throw Object.assign(new Error('Bad id'), { status: 400 }); return n; };
 
   // ---- health / dashboard / events
-  add('GET', `${P}/health`, () => ({ ok: true, version: require('../../package.json').version, db: app.db.driver }));
+  add('GET', `${P}/health`, () => ({ ok: true, version: require('../../package.json').version, db: app.db.driver, cloud: app.cloud ? app.cloud.state : 'off' }));
   add('GET', `${P}/dashboard`, () => app.dashboard());
-  add('GET', `${P}/events`, ({ q }) => app.events.recent(Math.min(500, +q.get('limit') || 50)));
+  add('GET', `${P}/events`, ({ q }) => {
+    const limit = Math.min(500, +q.get('limit') || 50);
+    const local = app.events.recent(limit);
+    const remote = app.cloud && app.cloud.sync ? app.cloud.sync.remoteActivity.map(a => ({ id: a.id, ts: a.ts, level: a.level, kind: a.kind, message: a.message, pc_name: a.pcName, remote: true })) : [];
+    return remote.length ? [...local, ...remote].sort((a, b) => b.ts - a.ts).slice(0, limit) : local;
+  });
+  // ---- cloud (v0.3)
+  add('GET', `${P}/cloud/status`, () => app.cloud.status());
+  add('POST', `${P}/cloud/signin`, async ({ body }) => app.cloud.signIn(body.email, body.password, { create: !!body.create }));
+  add('POST', `${P}/cloud/signout`, () => app.cloud.signOut());
+  add('POST', `${P}/cloud/offline`, () => app.cloud.useOffline());
+  add('POST', `${P}/cloud/reconnect`, () => app.cloud.reconnect());
+  add('POST', `${P}/cloud/passphrase`, ({ body }) => app.cloud.setPassphrase(body.passphrase, { force: !!body.force }));
+  add('POST', `${P}/cloud/drive/connect`, () => app.cloud.connectDrive());
+  add('POST', `${P}/cloud/drive/disconnect`, () => app.cloud.disconnectDrive());
+  add('POST', `${P}/cloud/backup/run`, async () => { if (!app.cloud.backup) throw Object.assign(new Error('Cloud sync is not on'), { status: 409 }); const r = await app.cloud.backup.tick(); return { uploaded: !!r, status: app.cloud.backup.status() }; });
   // ---- profiles
   add('GET', `${P}/profiles`, () => app.profiles.listProfiles());
   add('POST', `${P}/profiles`, ({ body }) => app.profiles.createProfile({ name: body.name, proxyId: body.proxyId, proxy: body.proxy, autoProxy: body.autoProxy !== false }));
@@ -94,6 +109,10 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
   const sseClients = new Set();
   const onEvent = ev => { const line = `data: ${JSON.stringify(ev)}\n\n`; for (const res of sseClients) res.write(line); };
   app.events.on('event', onEvent);
+  // cloud changes (other PCs) -> a named SSE event, debounced so a burst of snapshots is one UI refresh
+  let cloudT = null;
+  const onCloud = () => { if (cloudT) return; cloudT = setTimeout(() => { cloudT = null; for (const res of sseClients) res.write(`event: cloud\ndata: {}\n\n`); }, 800); };
+  app.events.on('cloud', onCloud);
 
   const send = (res, status, payload, origin) => {
     const body = JSON.stringify(payload);
@@ -141,7 +160,7 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
       const data = await route.handler({ p, q: u.searchParams, body: body || {}, req });
       send(res, 200, { code: 0, message: 'success', data }, origin);
     } catch (e) {
-      const status = e.status || (e.code === 'PROFILE_BUSY' ? 409 : e.code === 'PROXY_DEAD' ? 502 : 500);
+      const status = e.status || (['PROFILE_BUSY', 'PROFILE_LOCKED', 'BROWSER_LIMIT'].includes(e.code) ? 409 : e.code === 'PROXY_DEAD' ? 502 : 500);
       send(res, status, { code: status, message: e.message }, origin);
     }
   });
@@ -152,7 +171,7 @@ function startApiServer(app, { port = 53300, host = '127.0.0.1', uiToken = crypt
       const actual = server.address().port;
       resolve({
         server, port: actual, uiToken, url: `http://127.0.0.1:${actual}${P}`,
-        close: () => new Promise(r => { app.events.off('event', onEvent); for (const c of sseClients) c.end(); server.close(() => r()); server.closeAllConnections?.(); }),
+        close: () => new Promise(r => { app.events.off('event', onEvent); app.events.off('cloud', onCloud); clearTimeout(cloudT); for (const c of sseClients) c.end(); server.close(() => r()); server.closeAllConnections?.(); }),
       });
     });
   });

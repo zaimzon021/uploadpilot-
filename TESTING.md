@@ -1,4 +1,41 @@
-# TESTING — UploadPilot v0.1.0
+# TESTING — UploadPilot v0.3.0
+
+## v0.3.0 results (2026-11-26)
+
+Environment: Linux arm64 sandbox, Node 22.23, playwright-core 1.65 + Chromium 1255, ffmpeg, Python pproxy, **Firebase Emulator Suite** (firebase-tools 15.37, Firestore emulator 1.22 on Java 21). **No real Google/Firebase/Drive sign-in was made**; everything ran against the emulators, an in-memory Firestore stand-in and a mock Drive/OAuth server.
+
+| Suite | File | Tests | Pass |
+|---|---|---|---|
+| Existing unit suites (unchanged behaviour) | `test/unit/*` (8 files) | 39 | 39 |
+| Crypto: storageState AES-GCM round trip, wrong passphrase / tamper, proxy-password strings, verifier, state hash, secret store (safeStorage + fallback) | `cloud-crypto.test.js` | 5 | 5 |
+| Leases: 25 races (exactly one winner each), renew/release, expiry take-over + old holder told "lost", **clock skew** (10 min fast PC refused by server-time rule), "running on" watcher, uid isolation | `leases.test.js` | 6 | 6 |
+| Drive (mock server): folders, chunked resumable (exact Content-Range), **speed cap** timing, 403 `userRateLimitExceeded`/500 back-off, daily-limit stop, **abort mid-chunk + pause + resume from server offset**, download, session resume, 700 GB cap, OAuth loopback+PKCE (state check, sealed refresh token, refresh, revoke) | `drive.test.js` | 7 | 7 |
+| Two/three full app instances on one account: sync both ways (channels, profiles with encrypted proxy password, videos, plans, edits, stop), **no write ping-pong**; **two PCs race for one job → one upload**; **lease expiry take-over** (A dies mid-upload → B recovers, downloads the Drive backup, uploads, deletes cache + backup, A moves its file to Done); **profile lock**; **profile login sync** (export on close, encrypted on Drive, unchanged = no upload, B imports before navigation, passphrase mismatch refused) | `cloud-multi-pc.test.js` | 5 | 5 |
+| Built-in config + override + CI secret file; **offline mode unchanged** (no Firebase SDK loaded until sign-in, local ingest/plan works, "Use offline" persists, no config → unconfigured); client secret sealed; backup gating (idle window incl. midnight wrap, never during a YouTube upload, speed cap, driveFileId in Firestore); 360p ffmpeg copy (+ fallback); log rotation; pause-when-active + browser cap | `cloud-local.test.js` | 6 | 6 |
+| **Unit total** (`npm test`) | | **68** | **68** |
+| Existing e2e (api, upload-engine, failures, socks-bridge, autopilot) | `test/e2e/*` | 28 | 28 |
+| Real Chromium: cookie + localStorage + **IndexedDB** exported with `storageState({indexedDB:true})`, encrypted, imported into a fresh persistent profile with `setStorageState` | `profile-state.test.js` | 1 | 1 |
+| **E2E total** | | **29** | **29** |
+| **Firebase Emulator** (real JS SDK + real `firestore.rules`): lease races, rules deny other uid / non-server-time lease / skewed take-over, real 10 s expiry take-over; two full apps sync and never upload a job twice | `test/emulator/firestore-emulator.test.js` (`npm run test:emulator`) | 2 | 2 |
+
+**Total: 99 automated tests, all passing.** The e2e files were run one at a time (2-minute command cap in the sandbox).
+
+Bug the emulator found (fixed): the "recently changed videos" listener compared a number with Firestore Timestamps and matched nothing on real Firestore (the in-memory stand-in hid it). Queries now use `store.ts(ms)`.
+
+Electron smoke: this sandbox session no longer has GTK/Xvfb, so `npm run smoke:electron` could not start Electron. Instead the **real renderer** was loaded in Chromium against a headless core with two simulated PCs. Checked: the sign-in screen shows when signed out, "Create account" works, the dashboard shows a channel synced from the other PC with "PC: Home-PC", the next video title + time and "from Home-PC", and Settings → Cloud renders. The smoke script now also checks the sign-in screen and "Use offline". The Windows CI build packages the app.
+
+### v0.3 — needs live verification
+1. **Publish `firestore.rules`** in the console (production mode denies everything until then). The rules were tested in the emulator only.
+2. **Drive OAuth secret** must come from Settings → Cloud, env, or the `OAUTH_CLIENT_SECRET` repo secret. Consent screen in Testing: refresh tokens expire after 7 days, and only the test users can connect.
+3. Firebase JS SDK in Electron's main process (Node build, gRPC) was tested under Node 22 with the emulator, not inside packaged Electron against production.
+4. Real quota use on many channels. The status line in Settings → Cloud shows reads/writes per day.
+5. `setStorageState` on Windows persistent profiles with real Google cookies. Google may still ask for re-verification on a new IP/PC. The proxy travels with the profile, which helps.
+6. Drive resumable behaviour at the 750 GB/day limit, and real reason codes.
+7. Take-over timing: a PC that is merely asleep (not dead) for > 2 min loses its lease; its upload stops when it wakes (lease renewal refused). An offline PC uploads its own files without a lease. If another PC takes over the same video from Drive at the same time, it could be uploaded twice. Kept unlikely by the 120 min grace + the backup requirement.
+
+---
+
+# v0.1 / v0.2 test notes
 
 Environment: Linux arm64 sandbox, Node 22.23, Electron 45.5 (Node 24 inside), playwright-core 1.65 with Playwright Chromium (build 1255), Xvfb, ffmpeg, Python 3.12 + `pproxy` (an independent SOCKS5 server that supports auth).
 Rules followed: **no real Google/YouTube login, no real proxies or credentials.** Everything ran against local mocks.

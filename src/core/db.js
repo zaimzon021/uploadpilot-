@@ -72,6 +72,46 @@ class DB {
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     this.db.exec(SCHEMA);
     this._stmts = new Map();
+    this.migrate();
+  }
+
+  /** v0.3: cloud sync columns + change tracking. Safe to run on every start. */
+  migrate() {
+    const cols = t => new Set(this.db.prepare(`PRAGMA table_info(${t})`).all().map(r => r.name));
+    const add = (t, defs) => { const have = cols(t); for (const [c, d] of defs) if (!have.has(c)) this.db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${d}`); };
+    const common = [['cloud_id', 'TEXT'], ['dirty', 'INTEGER DEFAULT 1'], ['cloud_shadow', 'TEXT']];
+    add('channels', [...common, ['folder_pc', 'TEXT'], ['folder_pc_name', 'TEXT']]);
+    add('profiles', [...common, ['state_version', 'INTEGER DEFAULT 0'], ['state_hash', 'TEXT'], ['cloud_state_version', 'INTEGER DEFAULT 0'], ['cloud_state_hash', 'TEXT'], ['cloud_state_file', 'TEXT'], ['cloud_state_by', 'TEXT']]);
+    add('videos', [...common, ['remote', 'INTEGER DEFAULT 0'], ['origin_pc', 'TEXT'], ['origin_pc_name', 'TEXT'], ['drive_file_id', 'TEXT'], ['backup_error', 'TEXT']]);
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_cloud ON channels(cloud_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_cloud ON profiles(cloud_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_cloud ON videos(cloud_id);
+      CREATE INDEX IF NOT EXISTS idx_videos_dirty ON videos(dirty);
+      CREATE TABLE IF NOT EXISTS sync_ctx (id INTEGER PRIMARY KEY CHECK (id = 1), applying INTEGER NOT NULL DEFAULT 0);
+      INSERT OR IGNORE INTO sync_ctx(id, applying) VALUES (1, 0);
+      UPDATE sync_ctx SET applying = 0;
+      CREATE TABLE IF NOT EXISTS sync_tombstones (kind TEXT NOT NULL, cloud_id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(kind, cloud_id));
+      CREATE TABLE IF NOT EXISTS drive_jobs (video_id INTEGER PRIMARY KEY, session_url TEXT, size INTEGER, started_at INTEGER);
+    `);
+    // Local edits mark a row dirty (pushed to the cloud later); rows written by the sync itself
+    // (sync_ctx.applying = 1) don't, so remote changes never bounce back.
+    const trig = (t, colsList) => this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_${t}_ins AFTER INSERT ON ${t} WHEN (SELECT applying FROM sync_ctx WHERE id=1) = 0
+        BEGIN UPDATE ${t} SET dirty = 1 WHERE id = NEW.id; END;
+      CREATE TRIGGER IF NOT EXISTS trg_${t}_upd AFTER UPDATE OF ${colsList} ON ${t} WHEN (SELECT applying FROM sync_ctx WHERE id=1) = 0
+        BEGIN UPDATE ${t} SET dirty = 1 WHERE id = NEW.id; END;
+      CREATE TRIGGER IF NOT EXISTS trg_${t}_del AFTER DELETE ON ${t} WHEN OLD.cloud_id IS NOT NULL AND (SELECT applying FROM sync_ctx WHERE id=1) = 0
+        BEGIN INSERT OR REPLACE INTO sync_tombstones(kind, cloud_id, ts) VALUES ('${t}', OLD.cloud_id, CAST(strftime('%s','now') AS INTEGER) * 1000); END;`);
+    trig('channels', 'name, handle, yt_channel_id, folder, style, status, status_reason, paused_until, profile_id, last_run');
+    trig('profiles', 'number, name, proxy_id');
+    trig('videos', 'status, scheduled_at, title, description, tags, hashtags, edited, ai_status, ai_error, url, error, attempts, uploaded_at, drive_file_id, filename, size');
+  }
+
+  /** Run fn with change tracking off (used when applying changes that came from the cloud). */
+  applying(fn) {
+    this.db.exec('UPDATE sync_ctx SET applying = 1 WHERE id = 1');
+    try { return fn(); } finally { this.db.exec('UPDATE sync_ctx SET applying = 0 WHERE id = 1'); }
   }
   _p(sql) {
     let s = this._stmts.get(sql);

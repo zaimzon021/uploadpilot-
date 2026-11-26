@@ -14,7 +14,11 @@ class ProfileManager {
     this.launcher = launcher; this.proxyChecker = proxyChecker;
     this.sessions = new Map(); // profileId -> { bridge, handle, purpose, openedAt }
     this._opening = new Map();
+    // v0.3 cloud hooks (set by the app when cloud sync is on): profile lock + login snapshot sync
+    //   beforeOpen(prof, purpose)  afterLaunch(prof, sess)  beforeClose(prof, sess)  afterClose(prof)
+    this.hooks = null;
   }
+  async _hook(name, ...args) { if (this.hooks && this.hooks[name]) return this.hooks[name](...args); }
 
   // ---------- proxies ----------
   addProxies(text) {
@@ -130,9 +134,22 @@ class ProfileManager {
       if (s.handle.isClosed()) { await this.close(profileId); } else return s;
     }
     if (this._opening.has(profileId)) return this._opening.get(profileId);
+    // load rule: never more browsers than lanes (autopilot waits; manual windows count too)
+    const maxBrowsers = Math.max(1, this.settings.get('lanes') || 3);
+    if (purpose === 'auto' && this.sessions.size + this._opening.size >= maxBrowsers) throw Object.assign(new Error(`Browser limit reached (${maxBrowsers} open)`), { code: 'BROWSER_LIMIT' });
     const p = (async () => {
       const prof = this.getProfile(profileId);
       if (!prof) throw new Error(`Profile ${profileId} not found`);
+      await this._hook('beforeOpen', prof, purpose);       // cloud profile lock (throws PROFILE_LOCKED)
+      try { return await this._openLocked(prof, profileId, { purpose, startUrl, skipProxyCheck, windowMode, headless }); }
+      catch (e) { await this._hook('afterClose', prof).catch(() => {}); throw e; }
+    })();
+    this._opening.set(profileId, p);
+    try { return await p; } finally { this._opening.delete(profileId); }
+  }
+
+  async _openLocked(prof, profileId, { purpose, startUrl, skipProxyCheck, windowMode, headless }) {
+    {
       const cfg = this.settings.get('browser');
       let bridge = null, proxyInfo = null;
       if (prof.proxy_id) {
@@ -154,25 +171,40 @@ class ProfileManager {
       } catch (e) { if (bridge) await bridge.stop(); throw e; }
       const sess = { profileId, number: prof.number, bridge, handle, purpose, openedAt: Date.now(), exitIp: proxyInfo?.ip || null, cdpEndpoint: handle.cdpEndpoint };
       this.sessions.set(profileId, sess);
-      handle.context.on('close', () => { if (this.sessions.get(profileId) === sess) { this.sessions.delete(profileId); if (bridge) bridge.stop(); } });
+      handle.context.on('close', () => {
+        if (this.sessions.get(profileId) === sess) {
+          this.sessions.delete(profileId); clearInterval(sess.snapTimer); if (bridge) bridge.stop();
+          this._hook('afterClose', prof).catch(() => {});           // window closed by hand: free the lock
+        }
+      });
       this.db.run('UPDATE profiles SET last_opened=? WHERE id=?', Date.now(), profileId);
+      // newer login from another PC is imported before anything navigates
+      await this._hook('afterLaunch', prof, sess);
+      if (purpose !== 'auto' && this.hooks && this.hooks.beforeClose) {
+        // a hand-used window may be closed with the X button (no chance to export then): snapshot now and then
+        const every = Math.max(1, cfg.snapshotEveryMin || 3) * 60000;
+        sess.snapTimer = setInterval(() => { if (!sess.handle.isClosed()) this._hook('beforeClose', prof, sess).catch(() => {}); }, every);
+        if (sess.snapTimer.unref) sess.snapTimer.unref();
+      }
       if (startUrl) {
         const page = handle.context.pages()[0] || await handle.context.newPage();
         await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => this.events.warn(`Profile #${prof.number}: could not load ${startUrl}: ${e.message}`));
       }
       this.events.info(`Profile #${prof.number} opened (${purpose})${sess.exitIp ? ` · exit IP ${sess.exitIp}` : ''}`, { kind: 'profile' });
       return sess;
-    })();
-    this._opening.set(profileId, p);
-    try { return await p; } finally { this._opening.delete(profileId); }
+    }
   }
 
   async close(profileId) {
     const s = this.sessions.get(profileId);
     if (!s) return false;
     this.sessions.delete(profileId);
+    clearInterval(s.snapTimer);
+    const prof = this.getProfile(profileId) || { id: profileId, number: s.number };
+    await this._hook('beforeClose', prof, s).catch(() => {});   // save the login to the cloud if it changed
     try { await s.handle.close(); } catch (_) { /* ignore */ }
     if (s.bridge) await s.bridge.stop();
+    await this._hook('afterClose', prof).catch(() => {});       // free the profile lock
     this.events.info(`Profile #${s.number} closed`, { kind: 'profile' });
     return true;
   }

@@ -3,3 +3,6 @@ dist/
 smoke/result.json
 *.log
 browsers/
+config/cloud.secret.json
+config/cloud-config.json
+firestore-debug.log

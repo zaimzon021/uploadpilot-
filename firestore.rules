@@ -1,0 +1,71 @@
+rules_version = '2';
+// UploadPilot v0.3 — every document lives under users/{uid}; only that signed-in user can touch it.
+// Leases (job + profile locks) are the only documents with extra rules: they must carry the server
+// time (renewedAt == request.time), and another PC may only take one over once it has expired by the
+// SERVER clock, so a PC with a wrong local clock can never steal a live lease.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+    function small() {
+      return request.resource.data.size() <= 64;   // max number of fields per doc
+    }
+    function stamped() {
+      return request.resource.data.updatedAt == request.time && request.resource.data.updatedBy is string;
+    }
+
+    match /users/{uid} {
+      allow read, write: if owner(uid);
+
+      match /channels/{id} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && small() && stamped();
+      }
+      match /profiles/{id} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && small() && stamped();
+      }
+      match /videos/{id} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && small() && stamped()
+          && request.resource.data.status in ['queued', 'writing', 'uploading', 'done', 'failed', 'skipped'];
+      }
+      match /plans/{id} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && stamped();
+      }
+      match /activity/{id} {
+        allow read, delete: if owner(uid);
+        allow create: if owner(uid) && request.resource.data.message is string && request.resource.data.message.size() <= 1000;
+      }
+      match /pcs/{pcId} {
+        allow read, write: if owner(uid);
+      }
+      match /meta/{id} {
+        allow read, write: if owner(uid);
+      }
+
+      // ---- leases: {pcId, pcName, kind, renewedAt (server time), ttlSec, expiresAt (client estimate), released}
+      match /leases/{leaseId} {
+        function validLease() {
+          let d = request.resource.data;
+          return d.pcId is string && d.pcName is string
+            && d.renewedAt == request.time
+            && d.ttlSec is int && d.ttlSec >= 10 && d.ttlSec <= 900
+            && d.released is bool;
+        }
+        function expired(d) {
+          return d.released == true || request.time > d.renewedAt + duration.value(d.ttlSec, 's');
+        }
+        allow read: if owner(uid);
+        allow create: if owner(uid) && validLease();
+        // renew / release by the holder, or take over a released / expired lease
+        allow update: if owner(uid) && validLease()
+          && (resource.data.pcId == request.resource.data.pcId || expired(resource.data));
+        // clean-up of finished leases only
+        allow delete: if owner(uid) && expired(resource.data);
+      }
+    }
+  }
+}

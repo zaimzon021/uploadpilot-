@@ -16,6 +16,7 @@ class LaneScheduler {
    * @param {{min:number,max:number}} o.delayRangeMin   minutes
    * @param {number} [o.idleMs=30000]  how long an idle lane waits before looking again
    * @param {number} [o.cooldownMs=600000] a channel isn't picked again this soon after its last run
+   * @param {() => boolean} [o.canStart]  gate for starting NEW runs (e.g. false while the user uses the PC)
    */
   constructor(o) {
     this.o = { idleMs: 30000, cooldownMs: 10 * 60000, now: () => Date.now(), rng: Math.random, onEvent: () => {}, ...Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) };
@@ -45,6 +46,7 @@ class LaneScheduler {
 
   /** Choose and claim the next channel for a lane, or null. */
   claimNext(lane) {
+    if (this.o.canStart && !this.o.canStart()) return null;
     const due = new Set(this.o.getDueChannels());
     if (!due.size) return null;
     const order = this.dailyOrder();
