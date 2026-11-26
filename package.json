@@ -14,7 +14,7 @@
     "test:e2e": "node --test --test-concurrency=1 \"test/e2e/**/*.test.js\"",
     "test:all": "node --test --test-concurrency=1 \"test/unit/**/*.test.js\" \"test/e2e/**/*.test.js\"",
     "smoke:electron": "xvfb-run -a -s \"-screen 0 1600x1000x24\" electron . --smoke --no-sandbox",
-    "build": "electron-builder --win nsis --x64",
+    "build": "electron-builder --win nsis --x64 --publish never",
     "build:dir": "electron-builder --dir",
     "build:win-dir": "electron-builder --win --x64 --dir"
   },
